@@ -140,22 +140,34 @@ def filter_data_by_period(currency_rate, period):
 def run():
     st.title("환율 데이터 수집 및 차트")
 
+    # 데이터가 이미 수집되었는지 확인
+    if 'currency_rate' not in st.session_state:
+        st.session_state['currency_rate'] = None
+
+    # 데이터 수집 버튼
     if st.button("데이터 수집"):
-        st.write("데이터를 수집 중입니다...")
-        currency_rate = collect_currency_data()
-        st.success("데이터 수집 완료!")
+        with st.spinner("데이터를 수집 중입니다... 잠시만 기다려주세요."):
+            currency_rate = collect_currency_data()
+            st.session_state['currency_rate'] = currency_rate
+            st.success("데이터 수집이 완료되었습니다!")
 
-    # 기간 선택 옵션 추가
-    period_options = ["3개월", "1년", "3년", "전체"]
-    selected_period = st.selectbox("기간을 선택하세요:", period_options)
+    # 데이터가 수집된 경우에만 기간 선택과 차트 생성 표시
+    if st.session_state['currency_rate'] is not None:
+        currency_rate = st.session_state['currency_rate']
 
-    # 선택한 기간만큼 데이터 필터링
-    filtered_data = filter_data_by_period(currency_rate, selected_period)
+        # 기간 선택 옵션 추가
+        period_options = ["3개월", "1년", "3년", "전체"]
+        selected_period = st.selectbox("기간을 선택하세요:", period_options)
 
-    # 차트 생성 및 저장
-    st.write(f"{selected_period} 데이터를 기준으로 차트를 생성 중입니다...")
-    chart_file = generate_and_save_chart(filtered_data, f"currency_{selected_period}.png")
+        # 선택한 기간만큼 데이터 필터링
+        filtered_data = filter_data_by_period(currency_rate, selected_period)
+
+        # 차트 생성 및 저장
+        st.write(f"{selected_period} 데이터를 기준으로 차트를 생성 중입니다...")
+        chart_file = generate_and_save_chart(filtered_data, f"currency_{selected_period}.png")
 
         # 사용자가 클릭 시 차트 표시
-    if st.button(f'{selected_period} 차트 보기'):
-        st.image(chart_file, caption=f"{selected_period} 환율 차트")
+        if st.button(f'{selected_period} 차트 보기'):
+            st.image(chart_file, caption=f"{selected_period} 환율 차트")
+    else:
+        st.info("먼저 데이터를 수집하세요.")

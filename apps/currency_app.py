@@ -69,7 +69,7 @@ def market_index_crawling(key, start_date=None, pages=500):
 
 # 데이터 수집 로직 자동 실행 (전체 또는 최신 데이터만 수집)
 def collect_currency_data():
-    data_file_path = 'naver_currency.csv'
+    data_file_path = 'data/naver_currency.csv'
 
     # 데이터 파일이 존재할 경우: 최신 데이터만 가져오기
     if os.path.exists(data_file_path):
@@ -105,6 +105,7 @@ def collect_currency_data():
 
     return currency_rate
 
+
 # 차트를 저장하고 표시하는 함수
 def generate_and_save_chart(df, file_name):
     fig, axs = plt.subplots(len(df.columns) // 4 + 1, 4, figsize=(20, 15))
@@ -133,6 +134,7 @@ def filter_data_by_period(currency_rate, period):
 
     filtered_data = currency_rate.loc[currency_rate.index >= str(start_date.date())]
     return filtered_data
+
 
 # Streamlit UI 코드
 st.title("환율 데이터 수집 및 차트")

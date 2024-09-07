@@ -3,3 +3,11 @@
 ├── data_processor.py   # 데이터 처리 클래스
 ├── crawling.py         # 크롤링 기능 클래스
 ├── data               # 데이터 저장 폴더
+
+
+
+.
+├── main_app.py         # 메인 Streamlit 클라우드 애플리케이션
+├── app                 # 앱.py 저장 폴더
+     ├── currency_app.py         # 크롤링 기능 클래스
+     ├── data               # 데이터 저장    폴더

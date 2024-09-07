@@ -71,10 +71,9 @@ def run():
         data = pd.DataFrame(value, index=date, columns=[key.split()[1]])
         return data
 
-
-    # 데이터 수집 로직 자동 실행 (전체 또는 최신 데이터만 수집)
+    # 데이터 수집 로직 (전체 또는 최신 데이터만 수집)
     def collect_currency_data():
-        data_file_path = os.path.join(os.path.dirname(__file__), 'naver_currency.csv')  # 서브앱.py 가 있는 폴더
+        data_file_path = os.path.join(os.path.dirname(__file__), 'naver_currency.csv')
 
         # 데이터 파일이 존재할 경우: 최신 데이터만 가져오기
         if os.path.exists(data_file_path):
@@ -97,20 +96,20 @@ def run():
             st.write(f"최신 데이터를 추가로 수집했습니다. (마지막 수집일: {last_collected_date})")
 
         else:
-            st.error("데이터 파일이 존재하지 않습니다. 먼저 데이터를 수집해주세요.")
+            st.warning("데이터 파일이 존재하지 않습니다. 새로 데이터를 수집 중입니다...")
+            currency_rate = pd.DataFrame()
             for i, key in enumerate(hana_million_nat_url_dict.keys()):
                 tmp = market_index_crawling(key)
 
-                if i == 0:
+                if currency_rate.empty:
                     currency_rate = tmp
                 else:
                     currency_rate = pd.merge(currency_rate, tmp, left_index=True, right_index=True, how='inner')
 
             currency_rate.to_csv(data_file_path, index_label='date')
-            st.write("모든 데이터를 수집했습니다.")
+            st.write("모든 데이터를 새로 수집했습니다.")
 
         return currency_rate
-
 
     # 차트를 저장하고 표시하는 함수
     def generate_and_save_chart(df, file_name):
@@ -123,7 +122,6 @@ def run():
         plt.tight_layout()
         plt.savefig(file_name)
         return file_name
-
 
     # 선택한 기간만큼 데이터를 필터링하는 함수
     def filter_data_by_period(currency_rate, period):
@@ -140,7 +138,6 @@ def run():
 
         filtered_data = currency_rate.loc[currency_rate.index >= str(start_date.date())]
         return filtered_data
-
 
     # 데이터가 이미 수집되었는지 확인
     if 'currency_rate' not in st.session_state:

@@ -92,6 +92,7 @@ def collect_currency_data():
         st.write(f"최신 데이터를 추가로 수집했습니다. (마지막 수집일: {last_collected_date})")
 
     else:
+        st.error("데이터 파일이 존재하지 않습니다. 먼저 데이터를 수집해주세요.")
         for i, key in enumerate(hana_million_nat_url_dict.keys()):
             tmp = market_index_crawling(key)
 

@@ -145,17 +145,17 @@ def run():
         currency_rate = collect_currency_data()
         st.success("데이터 수집 완료!")
 
-        # 기간 선택 옵션 추가
-        period_options = ["3개월", "1년", "3년", "전체"]
-        selected_period = st.selectbox("기간을 선택하세요:", period_options)
+    # 기간 선택 옵션 추가
+    period_options = ["3개월", "1년", "3년", "전체"]
+    selected_period = st.selectbox("기간을 선택하세요:", period_options)
 
-        # 선택한 기간만큼 데이터 필터링
-        filtered_data = filter_data_by_period(currency_rate, selected_period)
+    # 선택한 기간만큼 데이터 필터링
+    filtered_data = filter_data_by_period(currency_rate, selected_period)
 
-        # 차트 생성 및 저장
-        st.write(f"{selected_period} 데이터를 기준으로 차트를 생성 중입니다...")
-        chart_file = generate_and_save_chart(filtered_data, f"currency_{selected_period}.png")
+    # 차트 생성 및 저장
+    st.write(f"{selected_period} 데이터를 기준으로 차트를 생성 중입니다...")
+    chart_file = generate_and_save_chart(filtered_data, f"currency_{selected_period}.png")
 
         # 사용자가 클릭 시 차트 표시
-        if st.button(f'{selected_period} 차트 보기'):
-            st.image(chart_file, caption=f"{selected_period} 환율 차트")
+    if st.button(f'{selected_period} 차트 보기'):
+        st.image(chart_file, caption=f"{selected_period} 환율 차트")

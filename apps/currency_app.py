@@ -69,7 +69,7 @@ def market_index_crawling(key, start_date=None, pages=500):
 
 # 데이터 수집 로직 자동 실행 (전체 또는 최신 데이터만 수집)
 def collect_currency_data():
-    data_file_path = 'data/naver_currency.csv'
+    data_file_path = os.path.join(os.path.dirname(__file__), 'naver_currency.csv')  # 서브앱.py 가 있는 폴더
 
     # 데이터 파일이 존재할 경우: 최신 데이터만 가져오기
     if os.path.exists(data_file_path):

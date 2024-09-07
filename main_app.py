@@ -8,8 +8,8 @@ st.title("SilverQ Main Application")
 st.sidebar.title("애플리케이션 선택")
 app_choice = st.sidebar.radio("애플리케이션을 선택하세요:", ["환율 추이", "더미 앱"])
 
-# # 선택한 앱에 따라 다른 기능을 보여줌
-# if app_choice == "환율 추이":
-#     currency_app.run()  # 환율 추이 앱을 실행
-# elif app_choice == "더미 앱":
-#     dummy_app.run()  # 더미 앱 실행
+# 선택한 앱에 따라 다른 기능을 보여줌
+if app_choice == "환율 추이":
+    currency_app.run()  # 환율 추이 앱을 실행
+elif app_choice == "더미 앱":
+    dummy_app.run()  # 더미 앱 실행

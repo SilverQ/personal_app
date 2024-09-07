@@ -40,6 +40,7 @@ hana_million_nat_url_dict = {
     '남아공 ZAR': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_ZARKRW'
 }
 
+
 # 크롤링 함수
 def market_index_crawling(key, start_date=None, pages=500):
     date = []
@@ -64,6 +65,7 @@ def market_index_crawling(key, start_date=None, pages=500):
 
     data = pd.DataFrame(value, index=date, columns=[key.split()[1]])
     return data
+
 
 # 데이터 수집 로직 자동 실행 (전체 또는 최신 데이터만 수집)
 def collect_currency_data():

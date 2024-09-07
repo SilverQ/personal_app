@@ -140,9 +140,9 @@ def filter_data_by_period(currency_rate, period):
 def run():
     st.title("환율 데이터 수집 및 차트")
 
-    st.write("데이터를 자동으로 수집 중입니다...")
-    currency_rate = collect_currency_data()
-    if currency_rate is not None:
+    if st.button("데이터 수집"):
+        st.write("데이터를 수집 중입니다...")
+        currency_rate = collect_currency_data()
         st.success("데이터 수집 완료!")
 
         # 기간 선택 옵션 추가
@@ -155,7 +155,6 @@ def run():
         # 차트 생성 및 저장
         st.write(f"{selected_period} 데이터를 기준으로 차트를 생성 중입니다...")
         chart_file = generate_and_save_chart(filtered_data, f"currency_{selected_period}.png")
-        st.success(f"{selected_period} 기간 차트 생성 완료!")
 
         # 사용자가 클릭 시 차트 표시
         if st.button(f'{selected_period} 차트 보기'):

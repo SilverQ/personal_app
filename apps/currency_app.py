@@ -77,23 +77,25 @@ def run():
 
         # 데이터 파일이 존재할 경우: 최신 데이터만 가져오기
         if os.path.exists(data_file_path):
-            currency_rate = pd.read_csv(data_file_path, index_col='date')
-
             try:
+                currency_rate = pd.read_csv(data_file_path, index_col='date')
                 currency_rate.index = pd.to_datetime(currency_rate.index, format="%Y-%m-%d")
+                st.success("데이터 파일을 성공적으로 불러왔습니다.")
+                st.dataframe(currency_rate.head())  # 데이터의 일부분을 화면에 표시
+                last_collected_date = currency_rate.index.max()
+
+                for key in hana_million_nat_url_dict.keys():
+                    tmp = market_index_crawling(key, start_date=last_collected_date)
+                    if not tmp.empty:
+                        currency_rate = pd.concat([tmp, currency_rate], axis=0)
+
+                currency_rate.to_csv(data_file_path, index_label='date')
+                st.write(f"최신 데이터를 추가로 수집했습니다. (마지막 수집일: {last_collected_date})")
+
+                return currency_rate
             except Exception as e:
-                st.error(f"날짜 형식 변환 실패: {e}")
+                st.error(f"데이터 읽기 실패: {e}")
                 return None
-
-            last_collected_date = currency_rate.index.max()
-
-            for key in hana_million_nat_url_dict.keys():
-                tmp = market_index_crawling(key, start_date=last_collected_date)
-                if not tmp.empty:
-                    currency_rate = pd.concat([tmp, currency_rate], axis=0)
-
-            currency_rate.to_csv(data_file_path, index_label='date')
-            st.write(f"최신 데이터를 추가로 수집했습니다. (마지막 수집일: {last_collected_date})")
 
         else:
             st.warning("데이터 파일이 존재하지 않습니다. 새로 데이터를 수집 중입니다...")

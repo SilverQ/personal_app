@@ -1,0 +1,5 @@
+.
+├── main_app.py         # 메인 Streamlit 애플리케이션
+├── data_processor.py   # 데이터 처리 클래스
+├── crawling.py         # 크롤링 기능 클래스
+├── data               # 데이터 저장 폴더

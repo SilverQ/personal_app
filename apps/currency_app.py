@@ -136,21 +136,27 @@ def filter_data_by_period(currency_rate, period):
     return filtered_data
 
 
-# Streamlit UI 코드
-st.title("환율 데이터 수집 및 차트")
+# 앱 실행 함수
+def run():
+    st.title("환율 데이터 수집 및 차트")
 
-# 데이터 수집 자동 실행
-st.write("데이터를 자동으로 수집 중입니다...")
-currency_rate = collect_currency_data()
-if currency_rate is not None:
-    st.success("데이터 수집 완료!")
+    st.write("데이터를 자동으로 수집 중입니다...")
+    currency_rate = collect_currency_data()
+    if currency_rate is not None:
+        st.success("데이터 수집 완료!")
 
-    # 기간 선택 옵션 추가
-    period_options = ["3개월", "1년", "3년", "전체"]
-    selected_period = st.selectbox("기간을 선택하세요:", period_options)
+        # 기간 선택 옵션 추가
+        period_options = ["3개월", "1년", "3년", "전체"]
+        selected_period = st.selectbox("기간을 선택하세요:", period_options)
 
-    # 선택한 기간만큼 데이터 필터링
-    filtered_data = filter_data_by_period(currency_rate, selected_period)
+        # 선택한 기간만큼 데이터 필터링
+        filtered_data = filter_data_by_period(currency_rate, selected_period)
 
-    # 차트 생성 및 저장
-    st.write(f"{selected_period} 데이터를 기준으로 차트를 생성 중입니다...")
+        # 차트 생성 및 저장
+        st.write(f"{selected_period} 데이터를 기준으로 차트를 생성 중입니다...")
+        chart_file = generate_and_save_chart(filtered_data, f"currency_{selected_period}.png")
+        st.success(f"{selected_period} 기간 차트 생성 완료!")
+
+        # 사용자가 클릭 시 차트 표시
+        if st.button(f'{selected_period} 차트 보기'):
+            st.image(chart_file, caption=f"{selected_period} 환율 차트")

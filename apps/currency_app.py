@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import requests as re
 import streamlit as st
-
+from apps.currency_dict import *
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
@@ -13,38 +13,6 @@ from datetime import datetime, timedelta
 # 앱 실행 함수
 def run():
     st.title("환율 데이터 수집 및 차트")
-
-    # 환율 정보 URL 매핑
-    hana_million_nat_url_dict = {
-        '미국 USD': 'http://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_USDKRW',
-        '유럽 EUR': 'http://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_EURKRW',
-        '일본 JPY': 'http://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_JPYKRW',
-        '중국 CNY': 'http://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_CNYKRW',
-        '영국 GBP': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_GBPKRW',
-        '캐나다 CAD': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_CADKRW',
-        '스위스 CHF': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_CHFKRW',
-        '홍콩 HKD': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_HKDKRW',
-        '스웨덴 SEK': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_SEKKRW',
-        '호주 AUD': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_AUDKRW',
-        'UAE AED': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_AEDKRW',
-        '바레인 BHD': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_BHDKRW',
-        '체코 CZK': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_CZKKRW',
-        '덴마크 DKK': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_DKKKRW',
-        '헝가리 HUF': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_HUFKRW',
-        '인도네시아 IDR': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_IDRKRW',
-        '쿠웨이트 KWD': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_KWDKRW',
-        '멕시코 MXN': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_MXNKRW',
-        '노르웨이 NOK': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_NOKKRW',
-        '뉴질랜드 NZD': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_NZDKRW',
-        '폴란드 PLN': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_PLNKRW',
-        '러시아 RUB': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_RUBKRW',
-        '사우디 SAR': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_SARKRW',
-        '싱가포르 SGD': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_SGDKRW',
-        '태국 THB': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_THBKRW',
-        '튀르키에 TRY': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_TRYKRW',
-        '남아공 ZAR': 'https://finance.naver.com/marketindex/exchangeDailyQuote.nhn?marketindexCd=FX_ZARKRW'
-    }
-
 
     # 크롤링 함수
     def market_index_crawling(key, start_date=None, pages=500):
@@ -84,10 +52,22 @@ def run():
                 st.dataframe(currency_rate.head())  # 데이터의 일부분을 화면에 표시
                 last_collected_date = currency_rate.index.max()
 
+                # 모든 키에 대해 데이터를 먼저 다운로드
+                new_data = pd.DataFrame()
                 for key in hana_million_nat_url_dict.keys():
                     tmp = market_index_crawling(key, start_date=last_collected_date)
                     if not tmp.empty:
-                        currency_rate = pd.concat([tmp, currency_rate], axis=0)
+                        if new_data.empty:
+                            new_data = tmp
+                        else:
+                            new_data = pd.merge(new_data, tmp, left_index=True, right_index=True, how='outer')
+
+                # 새로운 데이터가 있으면 기존 데이터와 연결
+                if not new_data.empty:
+                    currency_rate = pd.concat([new_data, currency_rate]).sort_index().drop_duplicates()
+                    st.write(f"최신 데이터를 추가로 수집했습니다. (마지막 수집일: {new_data.index.max()})")
+                else:
+                    st.write("새로운 데이터가 없습니다.")
 
                 currency_rate.to_csv(data_file_path, index_label='date')
                 st.write(f"최신 데이터를 추가로 수집했습니다. (마지막 수집일: {last_collected_date})")

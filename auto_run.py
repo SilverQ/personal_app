@@ -34,9 +34,14 @@ def update_github_repo():
 
 # Streamlit 서버 실행
 def run_streamlit():
-    streamlit_script = "D:/DL_work/personal_app/main_app.py --port 8501 --ip 0.0.0.0"
-    print(streamlit_script)
-    subprocess.Popen(["streamlit", "run", streamlit_script])
+    streamlit_script = r"D:\DL_work\personal_app\main_app.py"
+    command = [
+        "streamlit", "run", streamlit_script,
+        "--server.port=8501",
+        "--server.address=0.0.0.0"
+    ]
+    print("Running command:", " ".join(command))
+    subprocess.Popen(command)
 
 
 if __name__ == "__main__":

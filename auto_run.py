@@ -41,7 +41,7 @@ def run_streamlit():
         "--server.address=0.0.0.0"
     ]
     print("Running command:", " ".join(command))
-    subprocess.Popen(command)
+    subprocess.run(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
     with open("streamlit_error.log", "w") as error_log:
         subprocess.Popen(command, stderr=error_log)
 

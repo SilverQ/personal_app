@@ -2,12 +2,16 @@ import os
 import requests
 import git
 import subprocess
+import configparser
+import requests
 
 
 # DuckDNS IP 업데이트
 def update_duckdns():
-    domain = "http://silverq.duckdns.org"
-    token = "2b62b2c2-aaab-4bc6-9c5c-7f162f1835f1"
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    domain = config['DuckDNS']['domain']
+    token = config['DuckDNS']['token']
     url = f"https://www.duckdns.org/update?domains={domain}&token={token}&ip="
     requests.get(url)
 

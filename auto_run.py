@@ -42,6 +42,8 @@ def run_streamlit():
     ]
     print("Running command:", " ".join(command))
     subprocess.Popen(command)
+    with open("streamlit_error.log", "w") as error_log:
+        subprocess.Popen(command, stderr=error_log)
 
 
 if __name__ == "__main__":

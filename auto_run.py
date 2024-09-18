@@ -12,7 +12,7 @@ def update_duckdns():
     config.read('config.ini')
     domain = config['DuckDNS']['domain']
     token = config['DuckDNS']['token']
-    url = f"https://www.duckdns.org/update?domains={domain}&token={token}&ip="
+    url = f"https://www.duckdns.org/update?domains={domain}&token={token}"
     requests.get(url)
 
 

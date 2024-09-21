@@ -8,6 +8,10 @@ from apps.currency_dict import *
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+import logging  # 추가
+
+# urllib3의 디버그 로그 비활성화
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 # 앱 실행 함수
@@ -49,7 +53,8 @@ def run():
                 currency_rate = pd.read_csv(data_file_path, index_col='date')
                 currency_rate.index = pd.to_datetime(currency_rate.index, format="%Y-%m-%d")
                 st.success("데이터 파일을 성공적으로 불러왔습니다.")
-                st.dataframe(currency_rate.head())  # 데이터의 일부분을 화면에 표시
+                # 데이터의 일부분을 화면에 표시 (날짜 기준 내림차순으로 정렬)
+                st.dataframe(currency_rate.sort_index(ascending=False).head(3))
                 last_collected_date = currency_rate.index.max()
 
                 # 모든 키에 대해 데이터를 먼저 다운로드

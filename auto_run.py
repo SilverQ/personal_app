@@ -46,7 +46,19 @@ def run_streamlit():
         subprocess.Popen(command, stderr=error_log)
 
 
+# Ollama 백엔드 서버 실행
+def run_ollama_backend():
+    venv_path = r"D:\DL_work\personal_app\venv\Scripts\activate"
+    ollama_script = r"D:\DL_work\personal_app\apps\Ollama.py"
+    command = f'cmd /k "{venv_path} & python {ollama_script}"'
+    print("Running command:", command)
+    with open("ollama_backend_error.log", "w") as error_log:
+        result = subprocess.run(command, stderr=subprocess.PIPE, shell=True, text=True)
+        error_log.write(result.stderr)
+
+
 if __name__ == "__main__":
     update_duckdns()
     update_github_repo()
     run_streamlit()
+    run_ollama_backend()

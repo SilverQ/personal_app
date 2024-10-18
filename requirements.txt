@@ -1,6 +1,10 @@
-streamlit
-pandas
+tqdm
 numpy
-beautifulsoup4
+pandas
+openpyxl
 requests
+streamlit
 matplotlib
+scipy
+scikit-learn
+beautifulsoup4

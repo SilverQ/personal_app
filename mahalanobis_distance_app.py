@@ -4,12 +4,28 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+from scipy.stats import chi2
 from scipy.spatial import distance
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.covariance import EmpiricalCovariance
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+
+global log_content
+best_config = {
+            "pca_text": 60,
+            "pca_cpc": 100,
+            "threshold": 90,
+            "vectorizer_type": "count",
+            "scaling": True,
+            "ngram_range": [1, 3],
+            "max_features": 30000
+        }
+
+# Load stopwords from stopwords-ko.json
+with open('data/stopwords-ko.json', 'r', encoding='utf-8') as file:
+    korean_stopwords = json.load(file)
 
 
 # Function to read column names from a JSON file
@@ -39,12 +55,12 @@ def get_maingr(cpc_unsplitted, main_only=1):
     return processed_maingr_list
 
 
-def clean_numeric_data(df):
-    # Select only numeric columns from the dataframe
-    numeric_df = df.select_dtypes(include=[np.number])
-    return numeric_df
-
-
+# def clean_numeric_data(df):
+#     # Select only numeric columns from the dataframe
+#     numeric_df = df.select_dtypes(include=[np.number])
+#     return numeric_df
+#
+#
 def get_hier(cpc):
     tmp = set()
     for item in cpc:
@@ -68,52 +84,52 @@ def run():
     #     st.session_state['combined_vectors'] = None
 
     # Function to process KSIC input and evaluate data
-    def eval_data(ksic, threshold, scaler=True):
-        tmp_index = data['ksic'] == ksic
-        cluster1_vectors = combined_vectors[tmp_index]
-
-        # Log the number of records at this stage
-        update_log(f"Total records with selected KSIC '{ksic}': {len(cluster1_vectors)}")
-
-        # Check for low variance or collinearity issues
-        pca = PCA(n_components=130)  # Example: Adjust components to capture meaningful variance
-        reduced_vectors = pca.fit_transform(cluster1_vectors)
-        update_log(f"Variance explained by PCA: {pca.explained_variance_ratio_.sum():.2f}")
-        update_log(f"Number of records after PCA: {len(reduced_vectors)}")
-
-        # Scale data before Mahalanobis distance calculation
-        if scaler:
-            scaler = StandardScaler()
-            reduced_vectors = scaler.fit_transform(reduced_vectors)
-
-        # Check variance to ensure scaling is correct
-        variances = np.var(reduced_vectors, axis=0)
-        update_log(f"Data Variances:, sample: {variances[:3]}")
-
-        cov = EmpiricalCovariance().fit(reduced_vectors)
-        mahalanobis_distances = cov.mahalanobis(reduced_vectors)
-        update_log(f"Computed Mahalanobis distances, sample: {mahalanobis_distances[:5]}")
-        threshold_value = np.percentile(mahalanobis_distances, threshold)
-        update_log(f"Distance threshold for outliers: {threshold_value}")
-
-        # Add Mahalanobis distances to the data
-        data.loc[tmp_index, 'Mahalanobis_Distance'] = mahalanobis_distances
-
-        # Separate data into filtered and outlier sets
-        filtered_data = data.loc[tmp_index].copy()
-        data1 = filtered_data[filtered_data['Mahalanobis_Distance'] <= threshold_value]
-        data2 = filtered_data[filtered_data['Mahalanobis_Distance'] > threshold_value]
-
-        # Log the number of filtered and outlier records
-        update_log(f"Number of filtered records: {len(data1)}")
-        update_log(f"Number of outlier records: {len(data2)}")
-
-        return data1, data2
+    # def eval_data(ksic, threshold, scaler=True):
+    #     tmp_index = data['ksic'] == ksic
+    #     cluster1_vectors = combined_vectors[tmp_index]
+    #
+    #     # Log the number of records at this stage
+    #     # update_log(f"Total records with selected KSIC '{ksic}': {len(cluster1_vectors)}")
+    #
+    #     # Check for low variance or collinearity issues
+    #     pca = PCA(n_components=130)  # Example: Adjust components to capture meaningful variance
+    #     reduced_vectors = pca.fit_transform(cluster1_vectors)
+    #     # update_log(f"Variance explained by PCA: {pca.explained_variance_ratio_.sum():.2f}")
+    #     # update_log(f"Number of records after PCA: {len(reduced_vectors)}")
+    #
+    #     # Scale data before Mahalanobis distance calculation
+    #     if scaler:
+    #         scaler = StandardScaler()
+    #         reduced_vectors = scaler.fit_transform(reduced_vectors)
+    #
+    #     # Check variance to ensure scaling is correct
+    #     variances = np.var(reduced_vectors, axis=0)
+    #     # update_log(f"Data Variances:, sample: {variances[:3]}")
+    #
+    #     cov = EmpiricalCovariance().fit(reduced_vectors)
+    #     mahalanobis_distances = cov.mahalanobis(reduced_vectors)
+    #     # update_log(f"Computed Mahalanobis distances, sample: {mahalanobis_distances[:5]}")
+    #     threshold_value = np.percentile(mahalanobis_distances, threshold)
+    #     # update_log(f"Distance threshold for outliers: {threshold_value}")
+    #
+    #     # Add Mahalanobis distances to the data
+    #     data.loc[tmp_index, 'Mahalanobis_Distance'] = mahalanobis_distances
+    #
+    #     # Separate data into filtered and outlier sets
+    #     filtered_data = data.loc[tmp_index].copy()
+    #     data1 = filtered_data[filtered_data['Mahalanobis_Distance'] <= threshold_value]
+    #     data2 = filtered_data[filtered_data['Mahalanobis_Distance'] > threshold_value]
+    #
+    #     # Log the number of filtered and outlier records
+    #     # update_log(f"Number of filtered records: {len(data1)}")
+    #     # update_log(f"Number of outlier records: {len(data2)}")
+    #
+    #     return data1, data2
 
     # In your existing pipeline, clean the data before applying PCA
     def visualize_outliers(filtered_data, outlier_data, combined_vectors):
-    #     # Clean the combined_vectors to ensure only numeric data
-    #     cleaned_combined_vectors = clean_numeric_data(pd.DataFrame(combined_vectors))
+        # Clean the combined_vectors to ensure only numeric data
+        # cleaned_combined_vectors = clean_numeric_data(pd.DataFrame(combined_vectors))
         # Ensure you have enough samples and features for PCA
         num_samples, num_features = combined_vectors.shape
         if num_samples < 2 or num_features < 2:
@@ -123,7 +139,7 @@ def run():
         # Apply PCA to reduce the dimensionality to 2D for visualization
         pca = PCA(n_components=2)
         with tab4:
-    #         st.write(combined_vectors.shape())
+            # st.write(combined_vectors.shape())
             reduced_vectors = pca.fit_transform(combined_vectors)
 
             # Separate the data for plotting
@@ -150,10 +166,10 @@ def run():
             # Show plot
             st.pyplot(plt)
 
-    def update_log(new_entry):
-        global log_content
+    def update_log(log_content, new_entry):
+        # # global log_content
         log_content += new_entry + "\n"
-        log_area.text_area("Log Output", log_content, height=150)
+        # log_area.text_area("Log Output", log_content, height=150)
 
     def convert_df_to_excel(df):
         output = io.BytesIO()
@@ -200,7 +216,6 @@ def run():
         #     with col02:
             # Step 2: Display the first 3 rows of the uploaded data as a preview
             st.subheader(f"Preview of Data(결측치 제외 {len(data)}건)")
-            st.write(data.head(2))  # Show first 3 rows
 
             # Preprocess the data
             data['text'] = data['title'] + ', ' + data['ab'] + ', ' + data['cl']
@@ -210,24 +225,42 @@ def run():
             data.dropna(subset=['text', 'cpc_h'], inplace=True)
             data['Mahalanobis_Distance'] = np.nan
 
+            st.write(data[['title', 'ksic', 'an', 'cpc']].head(10))  # Show first 3 rows
+
             # Check if there are any documents left after preprocessing
             if data['text'].str.strip().eq('').all():
                 st.error("All text documents are empty after preprocessing.")
             else:
-                korean_stopwords = ['그리고', '그러나', '하지만', '또한', '그리고', '때문에', '그러므로', '그런데', '따라서',
-                                    '입니다', '있는', '이런', '있는', '이렇게', '저렇게', '그렇게']
+                # korean_stopwords = ['그리고', '그러나', '하지만', '또한', '그리고', '때문에', '그러므로', '그런데', '따라서',
+                #                     '입니다', '있는', '이런', '있는', '이렇게', '저렇게', '그렇게']
                 # Adjust TfidfVectorizer to handle stop words and ignore terms that are too frequent
-                vectorizer = TfidfVectorizer(max_features=30000, stop_words=korean_stopwords, min_df=2, ngram_range=(1, 3))
-    #             vectorizer = CountVectorizer(max_features=30000, stop_words=korean_stopwords, min_df=2, ngram_range=(1, 2))
+                vectorizer = TfidfVectorizer(
+                    max_features=30000, stop_words=korean_stopwords, min_df=2, ngram_range=(1, 3))
+                # vectorizer = CountVectorizer(max_features=30000, stop_words=korean_stopwords, min_df=2, ngram_range=(1, 2))
 
                 # Fit and transform the text data
                 text_vectors = vectorizer.fit_transform(data['text']).toarray()
+                # Perform PCA for text vectors
+                pca1 = PCA(n_components=best_config['pca_text'])
+                text_vectors_r = pca1.fit_transform(text_vectors)
+
         #         scaler = StandardScaler()
         #         text_vectors_scaled = scaler.fit_transform(text_vectors)
 
             # MultiLabelBinarizer for CPC
             mlb = MultiLabelBinarizer()
-            cpc_vector = mlb.fit_transform(data['cpc_h'])
+            cpc_vectors = mlb.fit_transform(data['cpc_h'])
+            # Perform PCA for CPC vectors
+            pca2 = PCA(n_components=best_config['pca_cpc'])
+            cpc_vectors_r = pca2.fit_transform(cpc_vectors)
+
+            # Combine CPC and text vectors
+            vectors_c = np.hstack([text_vectors_r, cpc_vectors_r])
+
+            # Apply scaling if specified
+            if best_config['scaling']:
+                scaler = StandardScaler()
+                vectors_c = scaler.fit_transform(vectors_c)
 
     with tab1:
         if uploaded_file:
@@ -241,45 +274,60 @@ def run():
 
                 with col2:
                     n_components_text = st.number_input("Text Vector dim(PCA)",
-                                                   min_value=2, max_value=min(text_vectors.shape[1], 1000), value=100, key='n_components_txt')
+                                                   min_value=2, max_value=min(text_vectors.shape[1], 1000), value=60, key='n_components_txt')
 
                 with col3:
                     n_components_cpc = st.number_input("CPC Vector dim(PCA)",
-                                                   min_value=2, max_value=min(cpc_vector.shape[1], 1000), value=30, key='n_components_cpc')
+                                                   min_value=2, max_value=min(cpc_vectors.shape[1], 1000), value=100, key='n_components_cpc')
 
                 with col4:
-                    threshold = st.slider("Distance Threshold %", 50, 99, 97, key='threshold_slider')
+                    # threshold = st.slider("Distance Threshold %", 80, 99, 90, key='threshold_slider')
+                    threshold = st.slider("Chi-squared confidence level (%)", 90, 99, 95, key='threshold_slider')
 
-                #     # Step 3: Ask for the dimension size to reduce the vectors
-                #     n_components = st.number_input("Enter the number of dimensions for PCA", min_value=2, max_value=min(combined_vectors.shape[1], 1000), value=50)
-
-                # Step 4: Perform dimensionality reduction using PCA : text
-                pca1 = PCA(n_components=n_components_text)
-                reduced_txt_vectors = pca1.fit_transform(text_vectors)
-
-                # Step 4: Perform dimensionality reduction using PCA : cpc
-                pca2 = PCA(n_components=n_components_cpc)
-                reduced_cpc_vectors = pca2.fit_transform(cpc_vector)
-
-                # Combine CPC and text vectors
-                combined_vectors = np.hstack([reduced_txt_vectors, reduced_cpc_vectors])
+                    # # Step 3: Ask for the dimension size to reduce the vectors
+                    # n_components = st.number_input("Enter the number of dimensions for PCA", min_value=2, max_value=min(combined_vectors.shape[1], 1000), value=50)
 
                 if st.button(f"Run Outlier Detection", key="run_detection"):
-                    eval_data(selected_ksic, threshold)
-                    filtered_data, outlier_data = eval_data(selected_ksic, threshold)
-                    combined_result = pd.concat([filtered_data, outlier_data])
+                    tmp_index = data['ksic'] == selected_ksic
+
+                    # Compute Mahalanobis distances for the test set
+                    cov = EmpiricalCovariance().fit(vectors_c[tmp_index])
+                    mahalanobis_distances = cov.mahalanobis(vectors_c[tmp_index])
+
+                    # Select the top 20 furthest points
+                    data.loc[tmp_index, 'Mahalanobis_Distance'] = mahalanobis_distances
+                    top_20_outliers = data[tmp_index].nlargest(20, 'Mahalanobis_Distance')
+
+                    # # cutoff 계산
+                    # threshold_value = np.percentile(mahalanobis_distances, threshold)
+                    # Chi-squared 분포 기반 cutoff 계산
+                    n_features = vectors_c.shape[1]
+                    threshold_value = chi2.ppf(threshold / 100, df=n_features)
+
+                    # Separate data into filtered and outlier sets
+                    filtered_data = data.loc[tmp_index].copy()
+                    data1 = filtered_data[filtered_data['Mahalanobis_Distance'] <= threshold_value]
+                    data2 = filtered_data[filtered_data['Mahalanobis_Distance'] > threshold_value]
+
+                    # # eval_data(selected_ksic, threshold)
+                    # filtered_data, outlier_data = eval_data(selected_ksic, threshold)
+                    #
+                    # # Combine CPC and text vectors
+                    # train_vectors_c = np.hstack([train_vectors_r, train_cpc_vectors_r])
+                    #
+                    # combined_result = pd.concat([filtered_data, outlier_data])
 
                     # Store the results in session state to persist
-                    st.session_state['filtered_data'] = filtered_data
-                    st.session_state['outlier_data'] = outlier_data
-                    st.session_state['combined_vectors'] = combined_result
+                    st.session_state['filtered_data'] = data1
+                    st.session_state['outlier_data'] = data2
+                    # st.session_state['combined_vectors'] = combined_result
 
                     with tab2:
-                        st.subheader(f"Filtered Data({len(filtered_data)})건")
-                        st.write(filtered_data[['적합성', 'title', 'ab', 'cl', 'Mahalanobis_Distance', 'ksic', 'maingr', 'an', 'cpc']].head(5))
+                        st.subheader(f"Filtered Data({len(data1)})건")
+                        st.write(data1[['Mahalanobis_Distance', 'ksic', 'maingr', 'title', 'ab', 'cl', 'an', 'cpc']].head(10))
 
-                        st.subheader(f"Outliers({len(outlier_data)})건")
-                        st.write(outlier_data[['적합성', 'title', 'ab', 'cl', 'Mahalanobis_Distance', 'ksic', 'maingr', 'an', 'cpc']].head(17))
+                        st.subheader(f"Outliers({len(data2)})건")
+                        st.write(data2[['Mahalanobis_Distance', 'ksic', 'maingr', 'title', 'ab', 'cl', 'an', 'cpc']].head(10))
 
             # Reset log and session state when KSIC changes
             if selected_ksic != st.session_state.get("last_ksic"):
@@ -292,19 +340,18 @@ def run():
                 if 'combined_vectors' in st.session_state:
                     del st.session_state['combined_vectors']
 
-    with tab3:
-        # Check if results are available
-    #     if 'filtered_data' in st.session_state and 'outlier_data' in st.session_state:
-        if st.session_state.get('filtered_data') is not None and st.session_state.get('outlier_data') is not None:
-            # Excel download button
-            st.download_button(
-                label=f"Download Excel({len(st.session_state['filtered_data']) + len(st.session_state['outlier_data'])}건)",
-                data=convert_df_to_excel(st.session_state['combined_vectors']),
-                file_name=f'{selected_ksic}_MahalanobisDistance.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-
-    with tab4:
-        # Visualization button
-        if st.button("Run Visualizer", key="run_visualizer"):
-            visualize_outliers(st.session_state['filtered_data'], st.session_state['outlier_data'], st.session_state['combined_vectors'])
+    # with tab3:
+    #     # Check if results are available
+    #     if st.session_state.get('filtered_data') is not None and st.session_state.get('outlier_data') is not None:
+    #         # Excel download button
+    #         st.download_button(
+    #             label=f"Download Excel({len(st.session_state['filtered_data']) + len(st.session_state['outlier_data'])}건)",
+    #             data=convert_df_to_excel(st.session_state['combined_vectors']),
+    #             file_name=f'{selected_ksic}_MahalanobisDistance.xlsx',
+    #             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    #         )
+    #
+    # with tab4:
+    #     # Visualization button
+    #     if st.button("Run Visualizer", key="run_visualizer"):
+    #         visualize_outliers(st.session_state['filtered_data'], st.session_state['outlier_data'], st.session_state['combined_vectors'])

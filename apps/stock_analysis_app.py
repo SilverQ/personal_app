@@ -14,10 +14,15 @@ import time
 import pickle
 import os
 from pathlib import Path
+import configparser
 import warnings
 warnings.filterwarnings('ignore')
 
 is_debugging = False
+
+config = configparser.ConfigParser()
+config.read('config.ini')
+dart_key = config['DART']['key']
 
 # PyKrx 임포트 (에러 처리 포함)
 try:
@@ -27,6 +32,285 @@ try:
 except ImportError:
     PYKRX_AVAILABLE = False
     st.error("❌ PyKrx 라이브러리가 설치되지 않았습니다. 'pip install pykrx'로 설치해주세요.")
+
+try:
+    import OpenDartReader
+    DART_AVAILABLE = True
+except ImportError:
+    DART_AVAILABLE = False
+
+
+class DartDataCollector:
+    """DART API를 활용한 재무데이터 수집"""
+
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        if api_key and DART_AVAILABLE:
+            self.dart = OpenDartReader.OpenDartReader(api_key)
+        else:
+            self.dart = None
+
+    def get_company_info(self, ticker):
+        """종목 코드로 회사 정보 조회"""
+        if not self.dart:
+            return None
+
+        try:
+            # 종목 코드로 회사 정보 검색
+            corp_list = self.dart.list()
+            company = corp_list[corp_list['stock_code'] == ticker]
+
+            if not company.empty:
+                return {
+                    'corp_code': company.iloc[0]['corp_code'],
+                    'corp_name': company.iloc[0]['corp_name'],
+                    'stock_code': ticker
+                }
+        except Exception as e:
+            st.error(f"회사 정보 조회 실패: {e}")
+        return None
+
+    def get_financial_statements(self, corp_code, years=5):
+        """재무제표 데이터 수집"""
+        if not self.dart:
+            return None
+
+        try:
+            current_year = datetime.now().year
+            financial_data = {}
+
+            for year in range(current_year - years, current_year):
+                try:
+                    # 연결재무제표 우선, 없으면 별도재무제표
+                    fs_data = self.dart.finstate(corp_code, year, reprt_code='11011')
+                    if fs_data is not None and not fs_data.empty:
+                        financial_data[year] = fs_data
+                        st.success(f"✅ {year}년 재무제표 수집 완료")
+                    else:
+                        st.warning(f"⚠️ {year}년 재무제표 없음")
+                except Exception as e:
+                    st.warning(f"⚠️ {year}년 데이터 수집 실패: {e}")
+
+            return financial_data
+        except Exception as e:
+            st.error(f"재무제표 수집 실패: {e}")
+        return None
+
+
+class DCFModel:
+    """DCF 밸류에이션 모델"""
+
+    def __init__(self):
+        self.risk_free_rate = 0.035  # 한국 10년 국고채
+        self.market_premium = 0.06  # 시장 위험 프리미엄
+        self.country_risk = 0.005  # 국가 위험 프리미엄
+        self.tax_rate = 0.25  # 한국 법인세율
+        self.terminal_growth = 0.025  # 영구성장률
+
+    def calculate_wacc(self, beta, debt_ratio=0.3):
+        """가중평균자본비용 계산"""
+        cost_of_equity = self.risk_free_rate + beta * (self.market_premium + self.country_risk)
+        cost_of_debt = self.risk_free_rate + 0.02  # 신용스프레드
+
+        wacc = (1 - debt_ratio) * cost_of_equity + debt_ratio * cost_of_debt * (1 - self.tax_rate)
+        return wacc
+
+    def extract_financial_metrics(self, financial_data):
+        """재무제표에서 주요 지표 추출"""
+        metrics = {}
+
+        for year, fs_data in financial_data.items():
+            try:
+                # 손익계산서 데이터 추출
+                income_stmt = fs_data[fs_data['sj_div'] == 'IS']
+
+                revenue = self._find_account_value(income_stmt, ['매출액', '수익(매출액)'])
+                ebit = self._find_account_value(income_stmt, ['영업이익'])
+                net_income = self._find_account_value(income_stmt, ['당기순이익'])
+
+                # 재무상태표 데이터 추출
+                balance_sheet = fs_data[fs_data['sj_div'] == 'BS']
+                total_assets = self._find_account_value(balance_sheet, ['자산총계'])
+                total_equity = self._find_account_value(balance_sheet, ['자본총계'])
+
+                # 현금흐름표 데이터 추출
+                cash_flow = fs_data[fs_data['sj_div'] == 'CF']
+                operating_cf = self._find_account_value(cash_flow, ['영업활동현금흐름'])
+
+                metrics[year] = {
+                    'revenue': revenue,
+                    'ebit': ebit,
+                    'net_income': net_income,
+                    'total_assets': total_assets,
+                    'total_equity': total_equity,
+                    'operating_cf': operating_cf
+                }
+
+            except Exception as e:
+                st.warning(f"{year}년 지표 추출 실패: {e}")
+                continue
+
+        return metrics
+
+    def _find_account_value(self, data, account_names):
+        """계정과목명으로 값 찾기"""
+        for name in account_names:
+            found = data[data['account_nm'].str.contains(name, na=False)]
+            if not found.empty:
+                try:
+                    return float(found.iloc[0]['thstrm_amount']) / 100000000  # 억원 단위
+                except:
+                    continue
+        return 0
+
+    def calculate_dcf(self, metrics, beta=1.0, forecast_years=5):
+        """DCF 계산"""
+        if len(metrics) < 3:
+            return None
+
+        years = sorted(metrics.keys())
+        latest_year = years[-1]
+
+        # 성장률 계산 (최근 3년 평균)
+        revenue_growth_rates = []
+        for i in range(len(years) - 2):
+            if metrics[years[i + 1]]['revenue'] > 0 and metrics[years[i]]['revenue'] > 0:
+                growth = (metrics[years[i + 1]]['revenue'] / metrics[years[i]]['revenue']) - 1
+                revenue_growth_rates.append(growth)
+
+        avg_growth = np.mean(revenue_growth_rates) if revenue_growth_rates else 0.05
+        avg_growth = max(-0.1, min(0.3, avg_growth))  # -10% ~ 30% 범위 제한
+
+        # 영업이익률 계산
+        operating_margins = []
+        for year in years[-3:]:
+            if metrics[year]['revenue'] > 0:
+                margin = metrics[year]['ebit'] / metrics[year]['revenue']
+                operating_margins.append(margin)
+
+        avg_margin = np.mean(operating_margins) if operating_margins else 0.1
+        avg_margin = max(0, min(0.5, avg_margin))  # 0% ~ 50% 범위 제한
+
+        # WACC 계산
+        wacc = self.calculate_wacc(beta)
+
+        # FCF 예측
+        base_revenue = metrics[latest_year]['revenue']
+        fcf_projections = []
+
+        for year in range(1, forecast_years + 1):
+            projected_revenue = base_revenue * ((1 + avg_growth) ** year)
+            projected_ebit = projected_revenue * avg_margin
+            projected_nopat = projected_ebit * (1 - self.tax_rate)
+
+            # 간단화된 FCF 계산 (투자 등 제외)
+            fcf = projected_nopat * 0.8  # 보수적 가정
+            pv_fcf = fcf / ((1 + wacc) ** year)
+
+            fcf_projections.append({
+                'year': year,
+                'revenue': projected_revenue,
+                'ebit': projected_ebit,
+                'fcf': fcf,
+                'pv_fcf': pv_fcf
+            })
+
+        # 터미널 가치 계산
+        terminal_fcf = fcf_projections[-1]['fcf'] * (1 + self.terminal_growth)
+        terminal_value = terminal_fcf / (wacc - self.terminal_growth)
+        pv_terminal = terminal_value / ((1 + wacc) ** forecast_years)
+
+        # 기업가치 계산
+        total_pv_fcf = sum([proj['pv_fcf'] for proj in fcf_projections])
+        enterprise_value = total_pv_fcf + pv_terminal
+
+        return {
+            'enterprise_value': enterprise_value,
+            'fcf_projections': fcf_projections,
+            'terminal_value': terminal_value,
+            'wacc': wacc,
+            'growth_rate': avg_growth,
+            'operating_margin': avg_margin,
+            'assumptions': {
+                'forecast_years': forecast_years,
+                'terminal_growth': self.terminal_growth,
+                'tax_rate': self.tax_rate,
+                'beta': beta
+            }
+        }
+
+
+class SRIMModel:
+    """S-RIM 밸류에이션 모델"""
+
+    def __init__(self):
+        self.risk_free_rate = 0.035
+        self.market_premium = 0.06
+        self.country_risk = 0.005
+
+    def calculate_roe_components(self, metrics):
+        """ROE 듀폰 분해"""
+        roe_data = {}
+
+        for year, data in metrics.items():
+            if data['total_equity'] > 0 and data['revenue'] > 0 and data['total_assets'] > 0:
+                # ROE = Net Margin × Asset Turnover × Equity Multiplier
+                net_margin = data['net_income'] / data['revenue']
+                asset_turnover = data['revenue'] / data['total_assets']
+                equity_multiplier = data['total_assets'] / data['total_equity']
+                roe = net_margin * asset_turnover * equity_multiplier
+
+                roe_data[year] = {
+                    'roe': roe,
+                    'net_margin': net_margin,
+                    'asset_turnover': asset_turnover,
+                    'equity_multiplier': equity_multiplier
+                }
+
+        return roe_data
+
+    def calculate_srim(self, metrics, roe_data, beta=1.0, forecast_years=5):
+        """S-RIM 계산"""
+        if len(roe_data) < 2:
+            return None
+
+        # 요구수익률 계산
+        required_return = self.risk_free_rate + beta * (self.market_premium + self.country_risk)
+
+        # 지속가능 ROE 추정 (최근 3년 평균)
+        recent_roes = [data['roe'] for data in list(roe_data.values())[-3:]]
+        sustainable_roe = np.mean(recent_roes)
+        sustainable_roe = max(0, min(0.5, sustainable_roe))  # 0% ~ 50% 제한
+
+        # 배당성향 추정 (보수적으로 30% 가정)
+        payout_ratio = 0.3
+        retention_ratio = 1 - payout_ratio
+        growth_rate = sustainable_roe * retention_ratio
+
+        # 현재 BPS 계산
+        latest_year = max(metrics.keys())
+        # 이 부분은 주식수 정보가 필요하므로 간단화
+        current_bps = 50000  # 임시값, 실제로는 총자본/발행주식수
+
+        # S-RIM 계산
+        if sustainable_roe <= required_return:
+            intrinsic_value = current_bps
+        else:
+            excess_roe = sustainable_roe - required_return
+            if required_return <= growth_rate:
+                intrinsic_value = current_bps * 2  # 간단한 프리미엄
+            else:
+                intrinsic_value = current_bps + (excess_roe * current_bps) / (required_return - growth_rate)
+
+        return {
+            'intrinsic_value': intrinsic_value,
+            'sustainable_roe': sustainable_roe,
+            'required_return': required_return,
+            'growth_rate': growth_rate,
+            'excess_roe': excess_roe,
+            'current_bps': current_bps,
+            'roe_components': roe_data
+        }
 
 
 class TradingDataManager:
@@ -949,6 +1233,340 @@ def detailed_investor_analysis():
             st.warning("⚠️ 외국인 투자자 데이터가 없습니다.")
 
 
+def display_valuation_results(company_info, dcf_result, srim_result, metrics, ticker):
+    """밸류에이션 결과 표시"""
+
+    # 현재 주가 조회
+    current_price = get_current_stock_price(ticker)
+
+    # 요약 결과
+    st.header("📊 적정주가 분석 결과")
+
+    # 메인 결과 카드
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        dcf_per_share = dcf_result['enterprise_value'] * 100 / 594  # 임시 주식수 (삼성전자)
+        st.metric(
+            "DCF 적정주가",
+            f"{dcf_per_share:,.0f}원",
+            f"{((dcf_per_share - current_price) / current_price * 100):+.1f}%" if current_price else None
+        )
+
+    with col2:
+        srim_price = srim_result['intrinsic_value']
+        st.metric(
+            "S-RIM 적정주가",
+            f"{srim_price:,.0f}원",
+            f"{((srim_price - current_price) / current_price * 100):+.1f}%" if current_price else None
+        )
+
+    with col3:
+        avg_price = (dcf_per_share + srim_price) / 2
+        st.metric(
+            "평균 적정주가",
+            f"{avg_price:,.0f}원",
+            f"{((avg_price - current_price) / current_price * 100):+.1f}%" if current_price else None
+        )
+
+    with col4:
+        if current_price:
+            st.metric(
+                "현재 주가",
+                f"{current_price:,.0f}원",
+                "기준가격"
+            )
+
+    # 상세 분석 탭
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 DCF 분석", "💎 S-RIM 분석", "📊 재무 지표", "📋 상세 데이터"])
+
+    with tab1:
+        display_dcf_analysis(dcf_result)
+
+    with tab2:
+        display_srim_analysis(srim_result)
+
+    with tab3:
+        display_financial_metrics(metrics)
+
+    with tab4:
+        display_detailed_data(company_info, dcf_result, srim_result)
+
+
+def display_dcf_analysis(dcf_result):
+    """DCF 분석 결과 표시"""
+    st.subheader("🔮 DCF 분석 상세")
+
+    # 주요 가정
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.info("**주요 가정**")
+        st.write(f"• WACC: {dcf_result['wacc']:.2%}")
+        st.write(f"• 매출 성장률: {dcf_result['growth_rate']:.2%}")
+        st.write(f"• 영업이익률: {dcf_result['operating_margin']:.2%}")
+        st.write(f"• 영구성장률: {dcf_result['assumptions']['terminal_growth']:.2%}")
+
+    with col2:
+        st.success("**기업가치**")
+        st.write(f"• 기업가치: {dcf_result['enterprise_value']:,.0f}억원")
+        st.write(f"• 터미널가치: {dcf_result['terminal_value']:,.0f}억원")
+        st.write(f"• 예측기간: {dcf_result['assumptions']['forecast_years']}년")
+
+    # FCF 예측 차트
+    if dcf_result['fcf_projections']:
+        fcf_data = pd.DataFrame(dcf_result['fcf_projections'])
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=fcf_data['year'],
+            y=fcf_data['fcf'],
+            name='예상 FCF',
+            marker_color='lightblue'
+        ))
+
+        fig.update_layout(
+            title="자유현금흐름 예측",
+            xaxis_title="연도",
+            yaxis_title="FCF (억원)",
+            height=400
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def display_srim_analysis(srim_result):
+    """S-RIM 분석 결과 표시"""
+    st.subheader("💎 S-RIM 분석 상세")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.info("**ROE 분석**")
+        st.write(f"• 지속가능 ROE: {srim_result['sustainable_roe']:.2%}")
+        st.write(f"• 요구수익률: {srim_result['required_return']:.2%}")
+        st.write(f"• 초과수익률: {srim_result['excess_roe']:.2%}")
+        st.write(f"• 성장률: {srim_result['growth_rate']:.2%}")
+
+    with col2:
+        st.success("**밸류에이션**")
+        st.write(f"• 현재 BPS: {srim_result['current_bps']:,.0f}원")
+        st.write(f"• 내재가치: {srim_result['intrinsic_value']:,.0f}원")
+
+    # ROE 트렌드 차트
+    if srim_result['roe_components']:
+        roe_df = pd.DataFrame(srim_result['roe_components']).T
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=roe_df.index,
+            y=roe_df['roe'] * 100,
+            mode='lines+markers',
+            name='ROE',
+            line=dict(color='green', width=3)
+        ))
+
+        fig.update_layout(
+            title="ROE 추이",
+            xaxis_title="연도",
+            yaxis_title="ROE (%)",
+            height=400
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def display_financial_metrics(metrics):
+    """재무 지표 표시"""
+    st.subheader("📊 주요 재무 지표")
+
+    # 데이터프레임 생성
+    df = pd.DataFrame(metrics).T
+    df = df.round(0)
+
+    # 지표별 차트
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # 매출액 추이
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df['revenue'],
+            mode='lines+markers',
+            name='매출액',
+            line=dict(color='blue', width=3)
+        ))
+
+        fig.update_layout(
+            title="매출액 추이",
+            xaxis_title="연도",
+            yaxis_title="매출액 (억원)",
+            height=300
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        # 영업이익 추이
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df['ebit'],
+            mode='lines+markers',
+            name='영업이익',
+            line=dict(color='green', width=3)
+        ))
+
+        fig.update_layout(
+            title="영업이익 추이",
+            xaxis_title="연도",
+            yaxis_title="영업이익 (억원)",
+            height=300
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 재무 데이터 테이블
+    st.subheader("📋 재무 데이터 상세")
+    st.dataframe(
+        df.style.format("{:,.0f}"),
+        use_container_width=True
+    )
+
+
+def get_current_stock_price(ticker):
+    """현재 주가 조회 (PyKrx 활용)"""
+    try:
+        if PYKRX_AVAILABLE:
+            today = datetime.now().strftime("%Y%m%d")
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+
+            price_data = stock.get_market_ohlcv_by_date(yesterday, today, ticker)
+            if not price_data.empty:
+                return price_data['종가'].iloc[-1]
+    except:
+        pass
+    return None
+
+
+def display_detailed_data(company_info, dcf_result, srim_result):
+    """상세 데이터 표시"""
+    st.subheader("📋 분석 상세 정보")
+
+    # 회사 정보
+    st.info("**회사 정보**")
+    st.json(company_info)
+
+    # DCF 상세
+    with st.expander("DCF 상세 데이터"):
+        st.json(dcf_result)
+
+    # S-RIM 상세
+    with st.expander("S-RIM 상세 데이터"):
+        st.json(srim_result)
+
+
+# 3. 적정주가 분석 탭 함수
+def valuation_analysis():
+    """적정주가 분석 탭"""
+    st.header("💰 적정주가 분석 (DCF + S-RIM)")
+
+    if not DART_AVAILABLE:
+        st.error("❌ OpenDartReader 라이브러리가 설치되지 않았습니다.")
+        st.info("터미널에서 다음 명령어로 설치해주세요: `pip install opendartreader`")
+        return
+
+    # DART API 키 입력
+    api_key = dart_key
+    # with st.expander("🔑 DART API 설정", expanded=True):
+        # api_key = st.text_input(
+        #     "DART API 키",
+        #     type="password",
+        #     help="DART 홈페이지(https://opendart.fss.or.kr)에서 발급받으세요"
+        # )
+        #
+        # if not api_key:
+        #     st.warning("⚠️ DART API 키를 입력해주세요.")
+        #     st.info("💡 DART API 키 발급: https://opendart.fss.or.kr > 인증키 신청")
+        #     return
+
+    # 분석 설정
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        ticker = st.text_input("종목 코드", value="005930", help="예: 005930 (삼성전자)")
+
+    with col2:
+        beta = st.number_input("베타", value=1.0, min_value=0.1, max_value=3.0, step=0.1)
+
+    with col3:
+        analysis_years = st.selectbox("분석 기간", [3, 5, 7], index=1)
+
+    if st.button("📊 적정주가 분석 시작", type="primary"):
+
+        with st.spinner("데이터 수집 및 분석 중..."):
+            # 데이터 수집기 초기화
+            dart_collector = DartDataCollector(api_key)
+
+            # 1. 회사 정보 조회
+            st.info("🔍 회사 정보 조회 중...")
+            company_info = dart_collector.get_company_info(ticker)
+
+            if not company_info:
+                st.error("❌ 종목 코드에 해당하는 회사를 찾을 수 없습니다.")
+                return
+
+            st.success(f"✅ {company_info['corp_name']} 정보 조회 완료")
+
+            # 2. 재무제표 수집
+            st.info("📋 재무제표 수집 중...")
+            financial_data = dart_collector.get_financial_statements(
+                company_info['corp_code'],
+                years=analysis_years
+            )
+
+            if not financial_data:
+                st.error("❌ 재무제표 데이터를 수집할 수 없습니다.")
+                return
+
+            # 3. DCF 분석
+            st.info("💹 DCF 분석 중...")
+            dcf_model = DCFModel()
+
+            # 재무 지표 추출
+            metrics = dcf_model.extract_financial_metrics(financial_data)
+
+            if not metrics:
+                st.error("❌ 재무 지표를 추출할 수 없습니다.")
+                return
+
+            # DCF 계산
+            dcf_result = dcf_model.calculate_dcf(metrics, beta)
+
+            # 4. S-RIM 분석
+            st.info("📈 S-RIM 분석 중...")
+            srim_model = SRIMModel()
+
+            # ROE 분해
+            roe_data = srim_model.calculate_roe_components(metrics)
+
+            # S-RIM 계산
+            srim_result = srim_model.calculate_srim(metrics, roe_data, beta)
+
+        # 결과 표시
+        if dcf_result and srim_result:
+            display_valuation_results(
+                company_info,
+                dcf_result,
+                srim_result,
+                metrics,
+                ticker
+            )
+        else:
+            st.error("❌ 밸류에이션 계산에 실패했습니다.")
+
+
 def run():
     """메인 실행 함수"""
     # 🔧 st.set_page_config 제거 (main.py에서 설정하므로)
@@ -960,13 +1578,16 @@ def run():
         return
 
     # 탭 생성
-    tab1, tab2 = st.tabs(["📈 기본 주식 분석", "👥 투자자별 매매동향"])
+    tab1, tab2, tab3 = st.tabs(["📈 기본 주식 분석", "👥 투자자별 매매동향(간략)", "💰 적정주가 분석"])
 
     with tab1:
         basic_stock_analysis()
 
     with tab2:
         investor_trading_analysis()
+
+    with tab3:
+        valuation_analysis()
 
     # 사용법 안내
     with st.expander("💡 사용법 안내"):

@@ -16,6 +16,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # 앱 실행 함수
 def run():
+
     st.title("📊 투자자별 매매동향 대시보드 (PyKrx 기반)")
 
     # st.set_page_config(page_title="투자자별 매매동향 대시보드", layout="wide")

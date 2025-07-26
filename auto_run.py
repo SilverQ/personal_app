@@ -61,4 +61,4 @@ if __name__ == "__main__":
     update_duckdns()
     update_github_repo()
     run_streamlit()
-    run_ollama_backend()
+    # run_ollama_backend()

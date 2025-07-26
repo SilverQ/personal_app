@@ -17,6 +17,8 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
+is_debugging = False
+
 # PyKrx 임포트 (에러 처리 포함)
 try:
     from pykrx import stock
@@ -25,6 +27,7 @@ try:
 except ImportError:
     PYKRX_AVAILABLE = False
     st.error("❌ PyKrx 라이브러리가 설치되지 않았습니다. 'pip install pykrx'로 설치해주세요.")
+
 
 class TradingDataManager:
     """투자자별 매매 데이터 관리 클래스"""
@@ -154,6 +157,7 @@ class TradingDataManager:
         else:
             return existing_data
 
+
 def load_simple_cache():
     """간단한 캐시 데이터 로드"""
     cache_file = "simple_trading_cache.pkl"
@@ -162,11 +166,13 @@ def load_simple_cache():
             return pickle.load(f)
     return {}
 
+
 def save_simple_cache(data):
     """간단한 캐시 데이터 저장"""
     cache_file = "simple_trading_cache.pkl"
     with open(cache_file, "wb") as f:
         pickle.dump(data, f)
+
 
 def get_simple_trading_data(ticker, start_date, end_date):
     """캐시를 활용한 간단한 거래 데이터 수집"""
@@ -259,6 +265,7 @@ def get_simple_trading_data(ticker, start_date, end_date):
 
     return pd.DataFrame()
 
+
 def create_investor_trend_chart(data, ticker_name):
     """투자자별 순매수 추이 차트"""
     if data.empty:
@@ -268,7 +275,7 @@ def create_investor_trend_chart(data, ticker_name):
 
     colors = {
         '개인': '#FF6B6B',
-        '기관계': '#4ECDC4',
+        '기관합계': '#4ECDC4',
         '외국인': '#45B7D1',
         '기타법인': '#96CEB4'
     }
@@ -276,7 +283,7 @@ def create_investor_trend_chart(data, ticker_name):
     # 데이터 구조 확인: '투자자구분' 컬럼이 있으면 상세 분석, 없으면 간단 분석
     if '투자자구분' in data.columns:
         # 상세 분석 데이터 (pivot 필요)
-        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        valid_investors = ['개인', '기관합계', '외국인']
         filtered_data = data[data['투자자구분'].isin(valid_investors)]
 
         if filtered_data.empty:
@@ -310,19 +317,21 @@ def create_investor_trend_chart(data, ticker_name):
         # 간단 분석 데이터 (PyKrx에서 반환 - index가 날짜)
         dates = data.index  # index가 날짜
 
-        # 실제 컬럼 확인 및 디버깅
-        st.write("🔍 **차트 생성 디버깅:**")
-        st.write("- **전체 컬럼:**", list(data.columns))
+        if is_debugging:
+            # 실제 컬럼 확인 및 디버깅
+            st.write("🔍 **차트 생성 디버깅:**")
+            st.write("- **전체 컬럼:**", list(data.columns))
 
         # 유효한 투자자 구분 찾기 (더 유연하게)
-        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        valid_investors = ['개인', '기관합계', '외국인', '기타법인']
         available_investors = []
 
         for col in data.columns:
             if col in valid_investors:
                 available_investors.append(col)
 
-        st.write("- **발견된 투자자 구분:**", available_investors)
+        if is_debugging:
+            st.write("- **발견된 투자자 구분:**", available_investors)
 
         if not available_investors:
             st.warning("⚠️ 유효한 투자자 구분을 찾을 수 없습니다.")
@@ -375,6 +384,7 @@ def create_investor_trend_chart(data, ticker_name):
 
     return fig
 
+
 def create_cumulative_chart(data, ticker_name):
     """누적 순매수 차트"""
     if data.empty:
@@ -382,7 +392,7 @@ def create_cumulative_chart(data, ticker_name):
 
     colors = {
         '개인': '#FF6B6B',
-        '기관계': '#4ECDC4',
+        '기관합계': '#4ECDC4',
         '외국인': '#45B7D1',
         '기타법인': '#96CEB4'
     }
@@ -392,7 +402,7 @@ def create_cumulative_chart(data, ticker_name):
     # 데이터 구조 확인: '투자자구분' 컬럼이 있으면 상세 분석, 없으면 간단 분석
     if '투자자구분' in data.columns:
         # 상세 분석 데이터 (pivot 필요)
-        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        valid_investors = ['개인', '기관합계', '외국인', '기타법인']
         filtered_data = data[data['투자자구분'].isin(valid_investors)]
 
         if filtered_data.empty:
@@ -427,7 +437,7 @@ def create_cumulative_chart(data, ticker_name):
         dates = data.index  # index가 날짜
 
         # 유효한 투자자 구분 찾기
-        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        valid_investors = ['개인', '기관합계', '외국인', '기타법인']
         available_investors = [col for col in data.columns if col in valid_investors]
 
         if not available_investors:
@@ -468,6 +478,7 @@ def create_cumulative_chart(data, ticker_name):
     )
 
     return fig
+
 
 def basic_stock_analysis():
     """기본 주식 분석 탭"""
@@ -510,8 +521,9 @@ def basic_stock_analysis():
                 )
 
             if not price_data.empty:
-                # 데이터 구조 확인 및 디버깅
-                st.write("📋 데이터 컬럼 확인:", list(price_data.columns))
+                if is_debugging:
+                    # 데이터 구조 확인 및 디버깅
+                    st.write("📋 데이터 컬럼 확인:", list(price_data.columns))
 
                 # 주가 차트
                 fig = go.Figure()
@@ -591,6 +603,7 @@ def basic_stock_analysis():
         except Exception as e:
             st.error(f"❌ 데이터 수집 중 오류가 발생했습니다: {e}")
 
+
 def investor_trading_analysis():
     """투자자별 매매동향 분석 탭"""
     st.header("👥 투자자별 매매동향 분석")
@@ -602,6 +615,7 @@ def investor_trading_analysis():
         simple_investor_analysis()
     else:
         detailed_investor_analysis()
+
 
 def simple_investor_analysis():
     """간단한 투자자 분석"""
@@ -624,7 +638,7 @@ def simple_investor_analysis():
 
     with col2:
         # 기간 설정
-        days = st.selectbox("분석 기간", [7, 14, 30, 60], index=2)
+        days = st.selectbox("분석 기간", [7, 14, 30, 60, 120, 150], index=2)
 
     with col3:
         # 캐시 관리
@@ -646,14 +660,14 @@ def simple_investor_analysis():
 
         if not data.empty:
             # 📋 데이터 구조 디버깅 (PyKrx 특성 반영)
-            with st.expander("🔍 데이터 구조 확인 (디버깅)", expanded=True):
+            with st.expander("🔍 데이터 구조 확인 (디버깅)", expanded=is_debugging):
                 st.write("**데이터 형태:** PyKrx의 get_market_trading_value_by_investor 결과")
                 st.write("**Index (날짜):**", f"{data.index.name if data.index.name else 'DatetimeIndex'} - {type(data.index)}")
                 st.write("**날짜 범위:**", f"{data.index.min()} ~ {data.index.max()}")
                 st.write("**컬럼들 (투자자별):**", list(data.columns))
 
                 # 투자자 구분 컬럼 확인
-                valid_investors = ['개인', '기관계', '외국인', '기타법인']
+                valid_investors = ['개인', '기관합계', '외국인']
                 found_investors = [col for col in data.columns if col in valid_investors]
                 st.write("**발견된 투자자 구분:**", found_investors)
 
@@ -690,7 +704,7 @@ def simple_investor_analysis():
                 individual_sum = data['개인'].sum() if '개인' in data.columns else 0
                 st.metric("개인 순매수", f"{individual_sum:,.0f}원")
             with col2:
-                institutional_sum = data['기관계'].sum() if '기관계' in data.columns else 0
+                institutional_sum = data['기관합계'].sum() if '기관합계' in data.columns else 0
                 st.metric("기관 순매수", f"{institutional_sum:,.0f}원")
             with col3:
                 foreign_sum = data['외국인'].sum() if '외국인' in data.columns else 0
@@ -714,6 +728,7 @@ def simple_investor_analysis():
                         format_dict[col] = "{:,.0f}"
 
                 st.dataframe(display_data.style.format(format_dict), use_container_width=True)
+
 
 def detailed_investor_analysis():
     """상세한 투자자 분석"""
@@ -813,7 +828,7 @@ def detailed_investor_analysis():
 
         if not ticker_data.empty:
             # 유효한 투자자 구분만 필터링
-            valid_investors = ['개인', '기관계', '외국인', '기타법인']
+            valid_investors = ['개인', '기관합계', '외국인']
             filtered_data = ticker_data[ticker_data['투자자구분'].isin(valid_investors)]
 
             if filtered_data.empty:
@@ -828,7 +843,7 @@ def detailed_investor_analysis():
             with col1:
                 # 일별 추이
                 fig1 = go.Figure()
-                colors = {'개인': '#FF6B6B', '기관계': '#4ECDC4', '외국인': '#45B7D1', '기타법인': '#96CEB4'}
+                colors = {'개인': '#FF6B6B', '기관합계': '#4ECDC4', '외국인': '#45B7D1', '기타법인': '#96CEB4'}
 
                 for investor in pivot.columns:
                     if investor in valid_investors:  # 추가 안전장치
@@ -877,7 +892,7 @@ def detailed_investor_analysis():
         st.subheader("📋 기간별 투자자 순매수 요약")
 
         # 유효한 투자자 구분만 필터링
-        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        valid_investors = ['개인', '기관합계', '외국인']
         filtered_summary_data = trading_data[trading_data['투자자구분'].isin(valid_investors)]
 
         if not filtered_summary_data.empty:
@@ -933,6 +948,7 @@ def detailed_investor_analysis():
         else:
             st.warning("⚠️ 외국인 투자자 데이터가 없습니다.")
 
+
 def run():
     """메인 실행 함수"""
     # 🔧 st.set_page_config 제거 (main.py에서 설정하므로)
@@ -975,6 +991,7 @@ def run():
         - 캐시를 활용하여 재실행 시 빠른 로딩
         - 영업일 기준으로 데이터 제공
         """)
+
 
 if __name__ == "__main__":
     run()

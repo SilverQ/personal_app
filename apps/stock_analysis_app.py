@@ -1,6 +1,6 @@
 """
 apps/stock_analysis_app.py
-주식 분석 통합 애플리케이션
+주식 분석 통합 애플리케이션 - 최종 수정 버전
 """
 
 import streamlit as st
@@ -183,16 +183,79 @@ def get_simple_trading_data(ticker, start_date, end_date):
 
     try:
         st.info(f"📥 {ticker} 데이터 수집 중...")
-        data = stock.get_market_trading_value_by_investor(start_date, end_date, ticker)
 
-        if not data.empty:
-            data = data.reset_index()
-            cache[cache_key] = data
+        # 🔧 일별 데이터를 개별적으로 수집하는 방식으로 변경
+        date_range = pd.bdate_range(start_date, end_date)
+        daily_data = []
+
+        st.write(f"🔍 **{len(date_range)}일의 데이터를 개별 수집 중...**")
+
+        for i, date in enumerate(date_range):
+            date_str = date.strftime("%Y%m%d")
+            try:
+                # 하루씩 데이터 수집
+                daily_result = stock.get_market_trading_value_by_investor(date_str, date_str, ticker)
+
+                if not daily_result.empty:
+                    # 데이터가 transpose된 형태이므로 올바르게 처리
+                    # Index가 투자자구분, Columns가 거래타입
+                    if '순매수' in daily_result.columns:
+                        # 순매수 컬럼만 추출하고 transpose
+                        day_data = daily_result['순매수'].to_frame().T
+                        day_data.index = [date]  # 날짜를 index로 설정
+                        daily_data.append(day_data)
+
+                # 진행상황 표시 (매 5일마다)
+                if (i + 1) % 5 == 0:
+                    st.write(f"  진행: {i + 1}/{len(date_range)} 일 완료")
+
+            except Exception as e:
+                st.write(f"  ⚠️ {date_str} 데이터 수집 실패: {e}")
+                continue
+
+            # API 제한을 위한 대기
+            time.sleep(0.5)
+
+        if daily_data:
+            # 모든 일별 데이터를 합치기
+            combined_data = pd.concat(daily_data, ignore_index=False)
+            combined_data = combined_data.fillna(0)
+
+            st.write("🔍 **최종 데이터 구조:**")
+            st.write("- **Index (날짜):**", f"{type(combined_data.index)}")
+            st.write("- **날짜 범위:**", f"{combined_data.index.min()} ~ {combined_data.index.max()}")
+            st.write("- **컬럼들 (투자자별):**", list(combined_data.columns))
+            st.write("- **데이터 형태:**", combined_data.shape)
+            st.write("- **첫 번째 행:**")
+            st.dataframe(combined_data.head())
+
+            cache[cache_key] = combined_data
             save_simple_cache(cache)
-            st.success(f"✅ {ticker} 데이터 수집 완료")
-            return data
+            st.success(f"✅ {ticker} 일별 데이터 수집 완료!")
+            return combined_data
+        else:
+            st.error("❌ 수집된 데이터가 없습니다.")
+
     except Exception as e:
         st.error(f"❌ {ticker} 데이터 수집 실패: {e}")
+
+        # 🔧 원본 함수 결과 상세 분석
+        st.info("🔍 **원본 함수 결과 분석:**")
+        try:
+            test_data = stock.get_market_trading_value_by_investor(start_date, end_date, ticker)
+            st.write("**원본 데이터 형태:**")
+            st.write("- **Index:**", test_data.index.tolist())
+            st.write("- **Columns:**", test_data.columns.tolist())
+            st.write("- **Values:**")
+            st.dataframe(test_data)
+
+            # transpose 시도
+            st.write("**Transpose 결과:**")
+            transposed = test_data.T
+            st.dataframe(transposed)
+
+        except Exception as debug_e:
+            st.error(f"디버깅 실패: {debug_e}")
 
     return pd.DataFrame()
 
@@ -210,17 +273,97 @@ def create_investor_trend_chart(data, ticker_name):
         '기타법인': '#96CEB4'
     }
 
-    for investor in data.columns[1:]:
-        if investor in ['매도', '매수']:
-            continue
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=data[investor],
-            mode='lines+markers',
-            name=investor,
-            line=dict(color=colors.get(investor, '#999999'), width=2),
-            marker=dict(size=6)
-        ))
+    # 데이터 구조 확인: '투자자구분' 컬럼이 있으면 상세 분석, 없으면 간단 분석
+    if '투자자구분' in data.columns:
+        # 상세 분석 데이터 (pivot 필요)
+        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        filtered_data = data[data['투자자구분'].isin(valid_investors)]
+
+        if filtered_data.empty:
+            return None
+
+        # 날짜 컬럼 찾기
+        date_col = None
+        for col in ['date', '날짜', 'Date', 'DATE']:
+            if col in filtered_data.columns:
+                date_col = col
+                break
+
+        if date_col is None:
+            st.error("❌ 상세 분석: 날짜 컬럼을 찾을 수 없습니다.")
+            st.write("**사용 가능한 컬럼들:**", list(filtered_data.columns))
+            return None
+
+        pivot_data = filtered_data.pivot(index=date_col, columns='투자자구분', values='순매수')
+        pivot_data = pivot_data.fillna(0)
+
+        for investor in pivot_data.columns:
+            fig.add_trace(go.Scatter(
+                x=pivot_data.index,
+                y=pivot_data[investor],
+                mode='lines+markers',
+                name=investor,
+                line=dict(color=colors.get(investor, '#999999'), width=2),
+                marker=dict(size=6)
+            ))
+    else:
+        # 간단 분석 데이터 (PyKrx에서 반환 - index가 날짜)
+        dates = data.index  # index가 날짜
+
+        # 실제 컬럼 확인 및 디버깅
+        st.write("🔍 **차트 생성 디버깅:**")
+        st.write("- **전체 컬럼:**", list(data.columns))
+
+        # 유효한 투자자 구분 찾기 (더 유연하게)
+        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        available_investors = []
+
+        for col in data.columns:
+            if col in valid_investors:
+                available_investors.append(col)
+
+        st.write("- **발견된 투자자 구분:**", available_investors)
+
+        if not available_investors:
+            st.warning("⚠️ 유효한 투자자 구분을 찾을 수 없습니다.")
+            st.write("- **사용 가능한 모든 컬럼:**", list(data.columns))
+
+            # 컬럼명에 투자자 관련 키워드가 있는지 확인
+            possible_investors = []
+            investor_keywords = ['개인', '기관', '외국', '기타', 'individual', 'institution', 'foreign']
+            for col in data.columns:
+                for keyword in investor_keywords:
+                    if keyword in col:
+                        possible_investors.append(col)
+
+            if possible_investors:
+                st.info(f"🔍 투자자 관련 키워드가 포함된 컬럼들: {possible_investors}")
+                # 이 컬럼들을 사용해서 차트 생성 시도
+                for col in possible_investors:
+                    if not data[col].isna().all():
+                        fig.add_trace(go.Scatter(
+                            x=dates,
+                            y=data[col],
+                            mode='lines+markers',
+                            name=col,
+                            line=dict(width=2),
+                            marker=dict(size=6)
+                        ))
+            else:
+                return None
+        else:
+            # 차트에 데이터 추가
+            for investor in available_investors:
+                if investor in data.columns and not data[investor].isna().all():
+                    fig.add_trace(go.Scatter(
+                        x=dates,
+                        y=data[investor],
+                        mode='lines+markers',
+                        name=investor,
+                        line=dict(color=colors.get(investor, '#999999'), width=2),
+                        marker=dict(size=6)
+                    ))
+                    st.write(f"- **{investor} 데이터 추가됨:** {len(data[investor])}개 포인트")
 
     fig.update_layout(
         title=f"{ticker_name} 투자자별 순매수 추이",
@@ -237,11 +380,6 @@ def create_cumulative_chart(data, ticker_name):
     if data.empty:
         return None
 
-    # 순매수 컬럼만 선택
-    columns_to_plot = [col for col in data.columns if col not in ['매도', '매수'] and col != data.index.name]
-
-    fig = go.Figure()
-
     colors = {
         '개인': '#FF6B6B',
         '기관계': '#4ECDC4',
@@ -249,16 +387,77 @@ def create_cumulative_chart(data, ticker_name):
         '기타법인': '#96CEB4'
     }
 
-    for investor in columns_to_plot:
-        cumulative = data[investor].cumsum()
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=cumulative,
-            mode='lines',
-            name=investor,
-            line=dict(color=colors.get(investor, '#999999'), width=3),
-            fill='tonexty' if investor != columns_to_plot[0] else 'tozeroy'
-        ))
+    fig = go.Figure()
+
+    # 데이터 구조 확인: '투자자구분' 컬럼이 있으면 상세 분석, 없으면 간단 분석
+    if '투자자구분' in data.columns:
+        # 상세 분석 데이터 (pivot 필요)
+        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        filtered_data = data[data['투자자구분'].isin(valid_investors)]
+
+        if filtered_data.empty:
+            return None
+
+        # 날짜 컬럼 찾기
+        date_col = None
+        for col in ['date', '날짜', 'Date', 'DATE']:
+            if col in filtered_data.columns:
+                date_col = col
+                break
+
+        if date_col is None:
+            st.error("❌ 상세 분석: 날짜 컬럼을 찾을 수 없습니다.")
+            return None
+
+        pivot_data = filtered_data.pivot(index=date_col, columns='투자자구분', values='순매수')
+        pivot_data = pivot_data.fillna(0)
+        cumulative = pivot_data.cumsum()
+
+        for investor in cumulative.columns:
+            fig.add_trace(go.Scatter(
+                x=cumulative.index,
+                y=cumulative[investor],
+                mode='lines',
+                name=investor,
+                line=dict(color=colors.get(investor, '#999999'), width=3),
+                fill='tonexty' if investor != cumulative.columns[0] else 'tozeroy'
+            ))
+    else:
+        # 간단 분석 데이터 (PyKrx에서 반환 - index가 날짜)
+        dates = data.index  # index가 날짜
+
+        # 유효한 투자자 구분 찾기
+        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        available_investors = [col for col in data.columns if col in valid_investors]
+
+        if not available_investors:
+            # 투자자 관련 키워드가 있는 컬럼 찾기
+            investor_keywords = ['개인', '기관', '외국', '기타']
+            possible_investors = []
+            for col in data.columns:
+                for keyword in investor_keywords:
+                    if keyword in col:
+                        possible_investors.append(col)
+
+            if possible_investors:
+                available_investors = possible_investors
+            else:
+                st.warning("⚠️ 누적 차트: 유효한 투자자 구분을 찾을 수 없습니다.")
+                return None
+
+        # 선택된 투자자들의 데이터만 추출하고 누적 계산
+        investor_data = data[available_investors].fillna(0)
+        cumulative = investor_data.cumsum()
+
+        for investor in available_investors:
+            fig.add_trace(go.Scatter(
+                x=dates,
+                y=cumulative[investor],
+                mode='lines',
+                name=investor,
+                line=dict(color=colors.get(investor, '#999999'), width=3),
+                fill='tonexty' if investor != available_investors[0] else 'tozeroy'
+            ))
 
     fig.update_layout(
         title=f"{ticker_name} 누적 순매수",
@@ -446,6 +645,25 @@ def simple_investor_analysis():
             data = get_simple_trading_data(ticker, start_str, end_str)
 
         if not data.empty:
+            # 📋 데이터 구조 디버깅 (PyKrx 특성 반영)
+            with st.expander("🔍 데이터 구조 확인 (디버깅)", expanded=True):
+                st.write("**데이터 형태:** PyKrx의 get_market_trading_value_by_investor 결과")
+                st.write("**Index (날짜):**", f"{data.index.name if data.index.name else 'DatetimeIndex'} - {type(data.index)}")
+                st.write("**날짜 범위:**", f"{data.index.min()} ~ {data.index.max()}")
+                st.write("**컬럼들 (투자자별):**", list(data.columns))
+
+                # 투자자 구분 컬럼 확인
+                valid_investors = ['개인', '기관계', '외국인', '기타법인']
+                found_investors = [col for col in data.columns if col in valid_investors]
+                st.write("**발견된 투자자 구분:**", found_investors)
+
+                # 기타 컬럼들
+                other_cols = [col for col in data.columns if col not in valid_investors]
+                st.write("**기타 컬럼들:**", other_cols)
+
+                st.write("**데이터 샘플:**")
+                st.dataframe(data.head())
+
             # 차트 표시
             col1, col2 = st.columns(2)
 
@@ -453,57 +671,49 @@ def simple_investor_analysis():
                 chart = create_investor_trend_chart(data, selected_stock)
                 if chart:
                     st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.warning("⚠️ 추이 차트를 생성할 수 없습니다.")
 
             with col2:
                 cumulative_chart = create_cumulative_chart(data, selected_stock)
                 if cumulative_chart:
                     st.plotly_chart(cumulative_chart, use_container_width=True)
+                else:
+                    st.warning("⚠️ 누적 차트를 생성할 수 없습니다.")
 
-            # 요약 통계
+            # 요약 통계 (PyKrx 데이터 - 간단 분석)
             st.subheader("📈 기간 요약")
             col1, col2, col3, col4 = st.columns(4)
 
-            # 안전한 컬럼 접근
-            buy_col = None
-            for col in data.columns:
-                if '매수' in col and '순매수' not in col:
-                    buy_col = col
-                    break
-
+            # PyKrx 데이터에서 직접 합계 계산
             with col1:
-                if '개인' in data.columns:
-                    st.metric("개인 순매수", f"{data['개인'].sum():,.0f}원")
-                else:
-                    st.metric("개인 순매수", "N/A")
+                individual_sum = data['개인'].sum() if '개인' in data.columns else 0
+                st.metric("개인 순매수", f"{individual_sum:,.0f}원")
             with col2:
-                if '기관계' in data.columns:
-                    st.metric("기관 순매수", f"{data['기관계'].sum():,.0f}원")
-                else:
-                    st.metric("기관 순매수", "N/A")
+                institutional_sum = data['기관계'].sum() if '기관계' in data.columns else 0
+                st.metric("기관 순매수", f"{institutional_sum:,.0f}원")
             with col3:
-                if '외국인' in data.columns:
-                    st.metric("외국인 순매수", f"{data['외국인'].sum():,.0f}원")
-                else:
-                    st.metric("외국인 순매수", "N/A")
+                foreign_sum = data['외국인'].sum() if '외국인' in data.columns else 0
+                st.metric("외국인 순매수", f"{foreign_sum:,.0f}원")
             with col4:
-                if buy_col:
-                    st.metric("총 거래대금", f"{data[buy_col].sum():,.0f}원")
-                else:
-                    st.metric("총 거래대금", "N/A")
+                buy_sum = data['매수'].sum() if '매수' in data.columns else 0
+                st.metric("총 거래대금", f"{buy_sum:,.0f}원")
 
-            # 데이터 테이블
+            # 데이터 테이블 (PyKrx 데이터 - index가 날짜)
             with st.expander("📋 상세 데이터 보기"):
                 display_data = data.copy()
+
+                # PyKrx 데이터는 index가 날짜이므로 index를 포맷팅
                 if hasattr(display_data.index, 'strftime'):
                     display_data.index = display_data.index.strftime('%Y-%m-%d')
 
-                # 안전한 포맷팅
+                # 안전한 포맷팅 (투자자별 수치 데이터)
                 format_dict = {}
                 for col in display_data.columns:
-                    if any(keyword in col for keyword in ['매도', '매수', '순매수', '금액']):
+                    if any(keyword in col for keyword in ['매도', '매수', '순매수', '금액', '개인', '기관', '외국인', '기타']):
                         format_dict[col] = "{:,.0f}"
 
-                st.dataframe(display_data.style.format(format_dict))
+                st.dataframe(display_data.style.format(format_dict), use_container_width=True)
 
 def detailed_investor_analysis():
     """상세한 투자자 분석"""
@@ -589,6 +799,9 @@ def detailed_investor_analysis():
         with col4:
             st.metric("마지막 업데이트", trading_data['date'].max().strftime('%Y-%m-%d'))
 
+        # 🔍 투자자 구분 확인 (디버깅용)
+        st.write("**투자자 구분들:**", sorted(trading_data['투자자구분'].unique().tolist()))
+
     # 분석 결과 표시
     tab1, tab2, tab3 = st.tabs(["📊 개별 종목", "📋 종합 요약", "📈 비교 분석"])
 
@@ -599,7 +812,15 @@ def detailed_investor_analysis():
         ticker_data = trading_data[trading_data['ticker'] == selected_ticker]
 
         if not ticker_data.empty:
-            pivot = ticker_data.pivot(index='date', columns='투자자구분', values='순매수')
+            # 유효한 투자자 구분만 필터링
+            valid_investors = ['개인', '기관계', '외국인', '기타법인']
+            filtered_data = ticker_data[ticker_data['투자자구분'].isin(valid_investors)]
+
+            if filtered_data.empty:
+                st.warning("⚠️ 유효한 투자자 구분 데이터가 없습니다.")
+                return
+
+            pivot = filtered_data.pivot(index='date', columns='투자자구분', values='순매수')
             pivot = pivot.fillna(0)
 
             col1, col2 = st.columns(2)
@@ -610,13 +831,14 @@ def detailed_investor_analysis():
                 colors = {'개인': '#FF6B6B', '기관계': '#4ECDC4', '외국인': '#45B7D1', '기타법인': '#96CEB4'}
 
                 for investor in pivot.columns:
-                    fig1.add_trace(go.Scatter(
-                        x=pivot.index,
-                        y=pivot[investor],
-                        mode='lines+markers',
-                        name=investor,
-                        line=dict(color=colors.get(investor, '#999999'), width=2)
-                    ))
+                    if investor in valid_investors:  # 추가 안전장치
+                        fig1.add_trace(go.Scatter(
+                            x=pivot.index,
+                            y=pivot[investor],
+                            mode='lines+markers',
+                            name=investor,
+                            line=dict(color=colors.get(investor, '#999999'), width=2)
+                        ))
 
                 fig1.update_layout(
                     title=f"{selected_ticker_name} 투자자별 순매수 추이",
@@ -633,13 +855,14 @@ def detailed_investor_analysis():
                 fig2 = go.Figure()
 
                 for investor in cumulative.columns:
-                    fig2.add_trace(go.Scatter(
-                        x=cumulative.index,
-                        y=cumulative[investor],
-                        mode='lines',
-                        name=investor,
-                        line=dict(color=colors.get(investor, '#999999'), width=3)
-                    ))
+                    if investor in valid_investors:  # 추가 안전장치
+                        fig2.add_trace(go.Scatter(
+                            x=cumulative.index,
+                            y=cumulative[investor],
+                            mode='lines',
+                            name=investor,
+                            line=dict(color=colors.get(investor, '#999999'), width=3)
+                        ))
 
                 fig2.update_layout(
                     title=f"{selected_ticker_name} 누적 순매수",
@@ -653,24 +876,36 @@ def detailed_investor_analysis():
     with tab2:
         st.subheader("📋 기간별 투자자 순매수 요약")
 
-        summary = trading_data.groupby(['ticker', '투자자구분'])['순매수'].sum().reset_index()
-        summary_pivot = summary.pivot(index='ticker', columns='투자자구분', values='순매수')
-        summary_pivot = summary_pivot.fillna(0)
+        # 유효한 투자자 구분만 필터링
+        valid_investors = ['개인', '기관계', '외국인', '기타법인']
+        filtered_summary_data = trading_data[trading_data['투자자구분'].isin(valid_investors)]
 
-        # 종목명 추가
-        ticker_names = {v: k for k, v in popular_stocks.items()}
-        summary_pivot['종목명'] = summary_pivot.index.map(lambda x: ticker_names.get(x, x))
-        summary_pivot = summary_pivot[['종목명'] + [col for col in summary_pivot.columns if col != '종목명']]
+        if not filtered_summary_data.empty:
+            summary = filtered_summary_data.groupby(['ticker', '투자자구분'])['순매수'].sum().reset_index()
+            summary_pivot = summary.pivot(index='ticker', columns='투자자구분', values='순매수')
+            summary_pivot = summary_pivot.fillna(0)
 
-        st.dataframe(
-            summary_pivot.style.format({col: "{:,.0f}" for col in summary_pivot.columns if col != '종목명'}),
-            use_container_width=True
-        )
+            # 종목명 추가
+            ticker_names = {v: k for k, v in popular_stocks.items()}
+            summary_pivot['종목명'] = summary_pivot.index.map(lambda x: ticker_names.get(x, x))
+            summary_pivot = summary_pivot[['종목명'] + [col for col in summary_pivot.columns if col != '종목명']]
+
+            st.dataframe(
+                summary_pivot.style.format({col: "{:,.0f}" for col in summary_pivot.columns if col != '종목명'}),
+                use_container_width=True
+            )
+        else:
+            st.warning("⚠️ 유효한 투자자 구분 데이터가 없습니다.")
 
     with tab3:
         st.subheader("📈 종목별 외국인 순매수 비교")
 
-        foreign_data = trading_data[trading_data['투자자구분'] == '외국인'].copy()
+        # 유효한 외국인 데이터만 필터링
+        foreign_data = trading_data[
+            (trading_data['투자자구분'] == '외국인') |
+            (trading_data['투자자구분'] == '외국인투자자')
+        ].copy()
+
         if not foreign_data.empty:
             fig = go.Figure()
 
@@ -695,9 +930,12 @@ def detailed_investor_analysis():
             )
 
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("⚠️ 외국인 투자자 데이터가 없습니다.")
 
 def run():
     """메인 실행 함수"""
+    # 🔧 st.set_page_config 제거 (main.py에서 설정하므로)
     st.title("📊 주식 분석 대시보드")
 
     if not PYKRX_AVAILABLE:
@@ -737,7 +975,6 @@ def run():
         - 캐시를 활용하여 재실행 시 빠른 로딩
         - 영업일 기준으로 데이터 제공
         """)
-
 
 if __name__ == "__main__":
     run()

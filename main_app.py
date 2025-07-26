@@ -11,9 +11,9 @@ st.set_page_config(
     layout="wide",  # ← 이것이 핵심!
     initial_sidebar_state="expanded"
 )
-
-# 메인 페이지 제목
-st.title("SilverQ Main Application")
+#
+# # 메인 페이지 제목
+# st.title("SilverQ Main Application")
 
 # 사이드바에서 앱 선택
 st.sidebar.title("애플리케이션 선택")

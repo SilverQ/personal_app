@@ -18,7 +18,8 @@ def update_duckdns():
 
 # GitHub 저장소 업데이트
 def update_github_repo():
-    repo_path = "D:\DL_work\personal_app"
+    current_file_path = os.path.abspath(__file__)
+    repo_path = os.path.dirname(current_file_path)  # 또는 상위 폴더 기준으로 조정 가능
     repo = git.Repo(repo_path)
     # # 작업 디렉토리 경로
     # print(repo.working_dir)
@@ -34,9 +35,11 @@ def update_github_repo():
 
 # Streamlit 서버 실행
 def run_streamlit():
-    streamlit_script = r"D:\DL_work\personal_app\main_app.py"
+    # 가상환경 python 경로 (예: venv가 D:\DL_work\personal_app\venv 인 경우)
+    venv_python = os.path.join(os.path.dirname(__file__), "venv", "Scripts", "python.exe")
+    streamlit_script = os.path.join(os.path.dirname(__file__), "main_app.py")
     command = [
-        "streamlit", "run", streamlit_script,
+        venv_python, "-m", "streamlit", "run", streamlit_script,
         "--server.port=8501",
         "--server.address=0.0.0.0"
     ]
@@ -58,7 +61,7 @@ def run_ollama_backend():
 
 
 if __name__ == "__main__":
-    update_duckdns()
+    # update_duckdns()
     update_github_repo()
     run_streamlit()
     # run_ollama_backend()

@@ -457,6 +457,27 @@ def save_simple_cache(data):
     with open(cache_file, "wb") as f:
         pickle.dump(data, f)
 
+# 1. 동적 주식수 조회 함수 추가
+def get_share_count(ticker):
+    """동적으로 발행주식수 조회"""
+    try:
+        # KRX에서 발행주식수 조회
+        today = datetime.now().strftime("%Y%m%d")
+        market_data = stock.get_market_cap_by_date(today, today, ticker)
+        if not market_data.empty:
+            return market_data['상장주식수'].iloc[0] / 10000  # 만주 단위로 변환
+    except:
+        pass
+
+    # 기본값 반환 (종목별 대략적 값)
+    default_shares = {
+        '005930': 594,  # 삼성전자
+        '000660': 728,  # SK하이닉스
+        '035420': 163,  # 네이버
+        '035720': 414,  # 카카오
+    }
+    return default_shares.get(ticker, 100)  # 기본 100만주
+
 
 def get_simple_trading_data(ticker, start_date, end_date):
     """캐시를 활용한 간단한 거래 데이터 수집"""

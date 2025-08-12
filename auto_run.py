@@ -1,5 +1,5 @@
 import os
-import requests
+# import requests
 import git
 import subprocess
 import configparser

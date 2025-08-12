@@ -1,7 +1,7 @@
 import streamlit as st
 
 import mahalanobis_distance_app
-from apps import (currency_app, dummy_app, stock_analysis_app) # 각 앱을 모듈로 분리
+from apps import (currency_app, dummy_app, stock_analysis_app, stock_analysis_app_v2) # 각 앱을 모듈로 분리
 # from apps import chat
 
 # 🎯 와이드 레이아웃 설정 (이 부분 추가!)
@@ -26,7 +26,7 @@ app_choice = st.sidebar.radio("애플리케이션을 선택하세요:",
 if app_choice == "환율 추이":
     currency_app.run()  # 환율 추이 앱을 실행
 elif app_choice == "주식 분석":
-    stock_analysis_app.run()  # 대화 앱을 실행
+    stock_analysis_app_v2.run()  # 대화 앱을 실행
 elif app_choice == "Find Outlier":
     mahalanobis_distance_app.run()  # 대화 앱을 실행
 # elif app_choice == "Ollama":
@@ -34,3 +34,4 @@ elif app_choice == "Find Outlier":
 #     chat.run_app()  # 대화 앱을 실행
 elif app_choice == "더미 앱":
     dummy_app.run()  # 더미 앱 실행
+

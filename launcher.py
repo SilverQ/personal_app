@@ -149,5 +149,10 @@ if __name__ == "__main__":
         log.error("패키지 설치 실패: %s", e)
         sys.exit(1)
 
-    proc = run_streamlit()
-    log.info("로그 파일: %s / %s", LOGDIR / "streamlit.out", LOGDIR / "streamlit.err")
+    try:
+        proc = run_streamlit()
+        print('Successed to run app')
+        log.info("로그 파일: %s / %s", LOGDIR / "streamlit.out", LOGDIR / "streamlit.err")
+    except Exception as e:
+        log.error("앱 실행 실패: %s", e)
+        sys.exit(1)

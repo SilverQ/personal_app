@@ -121,7 +121,7 @@ def run_streamlit():
     cmd = [
         py, "-m", "streamlit", "run", str(APP),
         "--server.address=0.0.0.0",
-        "--server.port", os.environ.get("PORT", "8501"),
+        "--server.port", os.environ.get("PORT", "27224"),
         "--server.headless=true",
     ]
     out = open(LOGDIR / "streamlit.out", "a", encoding="utf-8")
@@ -144,7 +144,7 @@ if __name__ == "__main__":
 
     try:
         ensure_venv()
-        pip_install(["streamlit", "plotly", "kaleido", "reportlab", "pykrx", "OpenDartReader", "requests"])
+        pip_install(["requests", "streamlit", "plotly", "kaleido", "reportlab", "pykrx", "OpenDartReader", "requests"])
     except Exception as e:
         log.error("패키지 설치 실패: %s", e)
         sys.exit(1)

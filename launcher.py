@@ -139,6 +139,7 @@ if __name__ == "__main__":
 
     try:
         update_repo()
+        print('Successed to update app')
     except Exception as e:
         log.error("Git 업데이트 실패: %s", e)
 

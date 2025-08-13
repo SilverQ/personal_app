@@ -126,7 +126,7 @@ def run_streamlit():
     ]
     out = open(LOGDIR / "streamlit.out", "a", encoding="utf-8")
     err = open(LOGDIR / "streamlit.err", "a", encoding="utf-8")
-    log.info("Streamlit 시작…")
+    log.info("Streamlit 시작 at …", cmd)
     p = subprocess.Popen(cmd, stdout=out, stderr=err, cwd=str(ROOT))
     log.info("PID=%s", p.pid)
     return p

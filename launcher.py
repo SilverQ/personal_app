@@ -142,13 +142,13 @@ if __name__ == "__main__":
         print('Successed to update app')
     except Exception as e:
         log.error("Git 업데이트 실패: %s", e)
-
-    try:
-        ensure_venv()
-        pip_install(["requests", "streamlit", "plotly", "kaleido", "reportlab", "pykrx", "OpenDartReader", "requests"])
-    except Exception as e:
-        log.error("패키지 설치 실패: %s", e)
-        sys.exit(1)
+    #
+    # try:
+    #     ensure_venv()
+    #     pip_install(["requests", "streamlit", "plotly", "kaleido", "reportlab", "pykrx", "OpenDartReader", "requests"])
+    # except Exception as e:
+    #     log.error("패키지 설치 실패: %s", e)
+    #     sys.exit(1)
 
     try:
         proc = run_streamlit()

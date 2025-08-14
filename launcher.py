@@ -121,7 +121,7 @@ def run_streamlit():
     cmd = [
         py, "-m", "streamlit", "run", str(APP),
         "--server.address=0.0.0.0",
-        "--server.port", os.environ.get("PORT", "27224"),
+        "--server.port", os.environ.get("PORT", "8501"),
         "--server.headless=true",
     ]
     out = open(LOGDIR / "streamlit.out", "a", encoding="utf-8")

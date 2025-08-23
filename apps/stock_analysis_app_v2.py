@@ -127,7 +127,6 @@ def _ohlcv(ticker: str, start: str, end: str, adjusted: bool=False) -> pd.DataFr
     return stock.get_market_ohlcv_by_date(start, end, ticker, adjusted=adjusted)
 
 
-
 def _investor_daily(ticker: str, start: str, end: str, debug=None) -> pd.DataFrame:
     """영업일 기준 일자 index, 컬럼은 투자자 구분(개인/기관합계/외국인/기타법인) 순매수만 반환.
     debug: callable(event: str, message: str, **context)
@@ -231,6 +230,7 @@ def _latest_prices(ticker: str, log=None):
     except Exception as ex:
         if log: log("error", "PRICE_NOW", "조회 예외", error=str(ex), tb=traceback.format_exc())
         return None
+
 
 # =============================
 # DART 수집 & 모델 (견고화)
@@ -558,6 +558,7 @@ class SRIMModel:
             "current_bps": current_bps,
             "roe_components": parts,
         }
+
 
 # =============================
 # ReportBuilder (+ 진단 로그)

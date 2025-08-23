@@ -16,10 +16,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("launcher")
 
+
 def py_exe_from_venv() -> str:
     if platform.system() == "Windows":
         return str(VENV / "Scripts" / "python.exe")
     return str(VENV / "bin" / "python")
+
 
 def run(cmd, cwd=None, env=None, check=True):
     if isinstance(cmd, str):
@@ -32,6 +34,7 @@ def run(cmd, cwd=None, env=None, check=True):
         raise RuntimeError(f"Command failed: {' '.join(cmd)} (rc={p.returncode})")
     return p
 
+
 def ensure_venv():
     if VENV.exists():
         return
@@ -39,6 +42,7 @@ def ensure_venv():
     if not py:
         raise RuntimeError("python 실행 파일을 찾을 수 없습니다.")
     run([py, "-m", "venv", str(VENV)])
+
 
 def pip_install(reqs: list[str]):
     pip = [py_exe_from_venv(), "-m", "pip"]
@@ -48,6 +52,7 @@ def pip_install(reqs: list[str]):
         run(pip + ["install", "-r", str(req_txt)])
     if reqs:
         run(pip + ["install"] + reqs)
+
 
 def update_duckdns():
     cfg = configparser.ConfigParser()
@@ -65,6 +70,7 @@ def update_duckdns():
     except Exception as e:
         log.warning("DuckDNS 업데이트 실패: %s", e)
 
+
 def _copy_into(src: Path, dst: Path):
     for item in src.iterdir():
         if item.name in ("venv", "logs", ".git"):
@@ -79,6 +85,7 @@ def _copy_into(src: Path, dst: Path):
                 target.unlink()
             shutil.copy2(item, target)
 
+
 def _clean_project_except(dst: Path, keep=("venv", "logs")):
     for item in dst.iterdir():
         if item.name in keep:
@@ -88,6 +95,7 @@ def _clean_project_except(dst: Path, keep=("venv", "logs")):
         else:
             try: item.unlink()
             except FileNotFoundError: pass
+
 
 def update_repo():
     if (ROOT / ".git").exists():
@@ -114,6 +122,7 @@ def update_repo():
         shutil.rmtree(tmpdir, ignore_errors=True)
         log.info("리포지토리 초기 동기화 완료")
 
+
 def run_streamlit():
     py = py_exe_from_venv()
     if not Path(py).exists():
@@ -130,6 +139,7 @@ def run_streamlit():
     p = subprocess.Popen(cmd, stdout=out, stderr=err, cwd=str(ROOT))
     log.info("PID=%s", p.pid)
     return p
+
 
 if __name__ == "__main__":
     # try:

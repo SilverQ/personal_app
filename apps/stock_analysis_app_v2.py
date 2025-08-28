@@ -528,7 +528,7 @@ class SRIMModel:
                 out[y] = {"roe": roe, "net_margin": net_margin, "asset_turnover": at, "equity_multiplier": em}
         return out
 
-    def value(self, metrics: dict[int, dict], parts: dict[int, dict], beta: float = 1.0, window=3) -> dict | None:
+    def value(self, metrics: dict[int, dict], parts: dict[int, dict], beta: float = 1.0, window=3, current_bps: float | None = None) -> dict | None:
         if len(parts) < 2:
             return None
         rr = self.rfr + beta * (self.mrp + self.crp)
@@ -539,7 +539,10 @@ class SRIMModel:
         payout = 0.3
         retain = 1 - payout
         g = s_roe * retain
-        current_bps = 50000.0  # 단순화(실사용 시 총자본/주식수로 대체)
+
+        if current_bps is None or current_bps <= 0:
+            return None  # BPS 없이는 계산 불가
+
         if s_roe <= rr:
             iv = current_bps
             excess = 0.0
@@ -687,15 +690,36 @@ class ReportBuilder:
                         self._log("warning", "DCF", "DCF 계산 실패 또는 데이터 부족(기저 매출=0)")
                     else:
                         self._log("info", "DCF", "DCF 계산 완료", EV_억원=round(self.dcf["enterprise_value"], 0))
+                    # BPS 계산 (S-RIM용)
+                    calculated_bps = None
+                    try:
+                        cap_df = stock.get_market_cap_by_date(s, e, self.ticker)
+                        if not cap_df.empty:
+                            num_shares = cap_df['상장주식수'].iloc[-1]
+                            self._log("info", "SHARES", "상장주식수 확인", count=num_shares)
+                            if self.metrics:
+                                latest_year = sorted(self.metrics.keys())[-1]
+                                latest_equity = self.metrics[latest_year].get("total_equity")
+                                if latest_equity and latest_equity > 0 and num_shares > 0:
+                                    # 자본총계 단위: 억원
+                                    calculated_bps = (latest_equity * 100_000_000) / num_shares
+                                    self._log("info", "BPS_CALC", "BPS 계산 완료", bps=round(calculated_bps, 2), equity_억원=latest_equity, shares=num_shares)
+                                else:
+                                    self._log("warning", "BPS_CALC", "BPS 계산 불가 (자본총계 또는 주식수 없음)")
+                        else:
+                            self._log("warning", "SHARES", "시가총액/상장주식수 데이터 없음")
+                    except Exception as ex:
+                        self._log("error", "BPS_CALC", "BPS 계산 중 예외 발생", error=str(ex))
+
                     # SRIM
                     sr = SRIMModel(); parts = sr.roe_parts(self.metrics or {})
                     if not parts:
                         self._log("warning", "SRIM", "ROE 분해 결과 없음")
                     sr_window = min(self.years, max(2, len(parts)))
-                    self.srim = sr.value(self.metrics or {}, parts, beta=self.beta, window=sr_window)
-                    self._log("info", "ASSUMPTIONS", "SRIM 파라미터", window=sr_window)
+                    self.srim = sr.value(self.metrics or {}, parts, beta=self.beta, window=sr_window, current_bps=calculated_bps)
+                    self._log("info", "ASSUMPTIONS", "SRIM 파라미터", window=sr_window, bps=calculated_bps)
                     if self.srim is None:
-                        self._log("warning", "SRIM", "S-RIM 계산 실패 또는 데이터 부족")
+                        self._log("warning", "SRIM", "S-RIM 계산 실패 (BPS 데이터 부족 가능성)")
                     else:
                         self._log("info", "SRIM", "S-RIM 계산 완료", IV=self.srim.get("intrinsic_value"))
                 except Exception as ex:
@@ -708,8 +732,21 @@ class ReportBuilder:
 
     # ---------- 차트 ----------
     def build_charts(self):
+        # 공통 x축(시간) 처리를 위해 모든 차트를 여기서 한 번에 생성
+        price_ok = self.price_df is not None and not self.price_df.empty
+        inv_ok = self.inv_df is not None and not self.inv_df.empty
+
+        # 휴일/주말 제외 로직
+        def set_rangebreaks(fig, df):
+            if df is None or df.empty:
+                return
+            all_days = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
+            missing_days = all_days.difference(df.index)
+            fig.update_xaxes(rangebreaks=[dict(values=missing_days.strftime('%Y-%m-%d'))])
+
+        # 1. 주가 차트
         try:
-            if self.price_df is not None and not self.price_df.empty:
+            if price_ok:
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
                     x=self.price_df.index,
@@ -718,28 +755,44 @@ class ReportBuilder:
                     low=self.price_df.get("저가"),
                     close=self.price_df.get("종가"),
                     name="주가",
+                    increasing=dict(line_color="#D60000", fillcolor="#D60000"),  # HTS 빨간색
+                    decreasing=dict(line_color="#0051D6", fillcolor="#0051D6"),  # HTS 파란색
                 ))
-                fig.update_layout(title=f"{self.ticker_name} ({self.ticker}) 주가", height=420)
+                fig.update_layout(
+                    title=f"{self.ticker_name} ({self.ticker}) 주가",
+                    height=400,
+                    xaxis_rangeslider_visible=False  # 슬라이더는 하단 차트와 중복되므로 제거
+                )
+                set_rangebreaks(fig, self.price_df)
                 self.fig_price = fig
                 self._log("info", "CHART", "가격 차트 생성")
             else:
                 self._log("warning", "CHART", "가격 데이터 없음으로 차트 생략")
         except Exception as ex:
             self._log("error", "CHART", "가격 차트 생성 실패", error=str(ex), tb=traceback.format_exc())
+
+        # 2. 수급 차트 (누적, 일별)
         try:
-            if self.inv_df is not None and not self.inv_df.empty:
+            if inv_ok:
                 valid = [c for c in ["개인", "기관합계", "외국인", "기타법인"] if c in self.inv_df.columns]
                 if valid:
-                    fig1 = go.Figure()
-                    for c in valid:
-                        fig1.add_trace(go.Scatter(x=self.inv_df.index, y=self.inv_df[c], mode="lines+markers", name=c))
-                    fig1.update_layout(title="투자자별 순매수 추이", height=360, hovermode="x unified")
-                    self.fig_flow = fig1
-                    fig2 = go.Figure(); cum = self.inv_df[valid].fillna(0).cumsum()
+                    # 누적 순매수
+                    fig2 = go.Figure()
+                    cum = self.inv_df[valid].fillna(0).cumsum()
                     for c in valid:
                         fig2.add_trace(go.Scatter(x=cum.index, y=cum[c], mode="lines", name=c))
-                    fig2.update_layout(title="투자자별 누적 순매수", height=360, hovermode="x unified")
+                    fig2.update_layout(title="투자자별 누적 순매수", height=300, hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    set_rangebreaks(fig2, self.inv_df)
                     self.fig_flow_cum = fig2
+
+                    # 일별 순매수 (Bar 차트로 변경)
+                    fig1 = go.Figure()
+                    for c in valid:
+                        fig1.add_trace(go.Bar(x=self.inv_df.index, y=self.inv_df[c], name=c))
+                    fig1.update_layout(title="투자자별 순매수 추이", height=300, hovermode="x unified", barmode='relative', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    set_rangebreaks(fig1, self.inv_df)
+                    self.fig_flow = fig1
+
                     self._log("info", "CHART", "수급 차트 생성", cols=valid)
                 else:
                     self._log("warning", "CHART", "투자자 컬럼 없음", available=list(self.inv_df.columns))
@@ -900,41 +953,36 @@ class ReportBuilder:
         return html_path
 
     # ---------- 렌더 ----------
-    def render(self):
-        for m in self.warnings:
-            st.warning(m)
+    # ---------- 렌더 (컴포넌트화) ----------
+    def render_overview(self):
         st.subheader("📌 개요")
         c1, c2, c3, c4 = st.columns(4)
         with c1: st.metric("종목명", self.ticker_name)
         with c2: st.metric("종목코드", self.ticker)
         with c3: st.metric("분석기간(영업일)", f"{self.days}")
-        # with c4: st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A")
         with c4:
             if hasattr(self, "_price_info") and self._price_info:
+                st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A",
+                          help=f"최근일(잠정) 종가: {self._price_info['latest_close']:,.0f}원 ({self._price_info['latest_date']}) | 확정 종가: {self._price_info['settled_close']:,.0f}원 ({self._price_info['settled_date']})")
+            else:
                 st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A")
-                st.caption(
-                    f"최근일(잠정) 종가: {self._price_info['latest_close']:,.0f}원 "
-                    f"({self._price_info['latest_date']}) · "
-                    f"확정 종가: {self._price_info['settled_close']:,.0f}원 "
-                    f"({self._price_info['settled_date']})"
-                )
 
-        st.markdown("---")
-        st.subheader("📈 가격 추이")
-        if self.fig_price: st.plotly_chart(self.fig_price, use_container_width=True)
-        else: st.info("가격 데이터를 불러오지 못했습니다.")
-
-        st.markdown("---")
-        st.subheader("👥 투자자 수급")
+    def render_charts(self):
+        st.subheader("📈 종합 차트")
+        # 요청에 따라 주가, 누적 수급, 일별 수급 차트를 세로로 배열합니다.
+        # 각 차트의 x축은 휴일/주말이 제외되어 연속적으로 표시됩니다.
+        if self.fig_price:
+            st.plotly_chart(self.fig_price, use_container_width=True)
+        if self.fig_flow_cum:
+            st.plotly_chart(self.fig_flow_cum, use_container_width=True)
         if self.fig_flow:
-            col = st.columns(2)
-            with col[0]: st.plotly_chart(self.fig_flow, use_container_width=True)
-            with col[1]:
-                if self.fig_flow_cum: st.plotly_chart(self.fig_flow_cum, use_container_width=True)
-        else:
-            st.info("투자자별 순매수 데이터를 불러오지 못했습니다.")
+            st.plotly_chart(self.fig_flow, use_container_width=True)
 
-        st.markdown("---")
+        # 모든 차트 데이터가 없는 경우에만 메시지 표시
+        if not self.fig_price and not self.fig_flow:
+             st.info("차트 데이터를 불러오지 못했습니다.")
+
+    def render_valuation(self):
         st.subheader("💰 밸류에이션 요약 (DCF/S-RIM)")
         if self.dcf or self.srim:
             c1, c2, c3 = st.columns(3)
@@ -964,7 +1012,7 @@ class ReportBuilder:
         else:
             st.info("밸류에이션을 계산할 충분한 데이터가 없습니다.")
 
-        st.markdown("---")
+    def render_financials(self):
         st.subheader("📊 재무 지표(요약)")
         if self.metrics:
             df = pd.DataFrame(self.metrics).T.round(0)
@@ -972,7 +1020,7 @@ class ReportBuilder:
         else:
             st.info("재무 데이터가 없습니다.")
 
-        st.markdown("---")
+    def render_appendix(self):
         st.subheader("📎 부록")
         st.caption("원천 데이터 일부를 확인할 수 있습니다.")
         with st.expander("가격 데이터"):
@@ -988,7 +1036,7 @@ class ReportBuilder:
             else:
                 st.write("N/A")
 
-        st.markdown("---")
+    def render_logs(self):
         with st.expander("🔧 진단 로그 (수집/계산 과정)", expanded=True):
             if self.logs:
                 df = pd.DataFrame(self.logs)
@@ -1008,6 +1056,21 @@ class ReportBuilder:
             else:
                 st.write("로그가 없습니다.")
 
+    def render(self):
+        for m in self.warnings:
+            st.warning(m)
+        self.render_overview()
+        st.markdown("---")
+        self.render_charts()
+        st.markdown("---")
+        self.render_valuation()
+        st.markdown("---")
+        self.render_financials()
+        st.markdown("---")
+        self.render_appendix()
+        st.markdown("---")
+        self.render_logs()
+
 
 # =============================
 # Streamlit 진입점(메인에서 호출)
@@ -1017,55 +1080,119 @@ def run():
     # rerun에도 보고서를 유지하기 위해 세션 상태 사용
     if "rpt" not in st.session_state:
         st.session_state.rpt = None
+    if "aux_rpt" not in st.session_state:
+        st.session_state.aux_rpt = None
     if "report_ready" not in st.session_state:
         st.session_state.report_ready = False
 
     st.title("📊 주식 분석 (종합 보고서)")
 
+    @st.cache_data
+    def get_stock_list():
+        """pykrx에서 전체 종목 리스트를 조회하고 캐시합니다."""
+        if not PYKRX_AVAILABLE: return {}
+        try:
+            tickers = stock.get_market_ticker_list(market="KOSPI") + stock.get_market_ticker_list(market="KOSDAQ")
+            names = stock.get_market_ticker_name(tickers)
+            name_map = {name: ticker for ticker, name in names.items() if name}
+            return dict(sorted(name_map.items()))
+        except Exception:
+            return {}
+
+    stock_map = get_stock_list()
+    stock_names = list(stock_map.keys())
+
     # 메인 앱 사이드바를 침범하지 않도록, 본문 상단 컨트롤 패널 사용
     with st.container():
         with st.form("controls"):
             st.subheader("⚙️ 분석 설정")
-            c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
+            c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
             with c1:
-                ticker = st.text_input("종목 코드", value="005930", help="예: 005930 (삼성전자)")
+                if stock_names:
+                    try:
+                        samsung_idx = stock_names.index("삼성전자")
+                    except ValueError:
+                        samsung_idx = 0
+                    selected_name = st.selectbox("종목명", options=stock_names, index=samsung_idx)
+                    ticker = stock_map[selected_name]
+                else:
+                    ticker = st.text_input("종목 코드", value="005930", help="예: 005930 (삼성전자)")
             with c2:
-                days = st.slider("분석 기간(영업일)", 7, 180, 90, step=1)
+                days = st.slider("메인 기간(일)", 7, 730, 90, step=1)
             with c3:
                 beta = st.number_input("베타", value=1.0, min_value=0.1, max_value=3.0, step=0.1)
             with c4:
-                years = st.selectbox("재무 반영 연수", [3, 5, 7], index=1)
+                years = st.selectbox("재무 연수", [3, 5, 7], index=1)
 
             with st.expander("고급 설정", expanded=False):
-                use_dart = st.checkbox("DART 사용", value=bool(DART_KEY), help="config.ini에 키가 있어야 활성화됩니다.")
+                use_dart = st.checkbox("DART 재무분석 사용", value=bool(DART_KEY), help="config.ini에 키가 있어야 활성화됩니다.")
+                use_aux_chart = st.checkbox("보조차트 활성화", help="오른쪽에 다른 기간의 보조차트를 함께 표시합니다.")
+                aux_days = st.slider("보조차트 기간(일)", 7, 365, 60, step=1, disabled=not use_aux_chart)
 
             submitted = st.form_submit_button("📄 종합 보고서 생성")
 
     # 제출 시 새 보고서 생성 → 세션에 저장
     if submitted:
-        rpt = ReportBuilder(ticker=ticker, days=days, beta=beta, years=years, use_dart=use_dart)
-        if rpt.validate():
-            with st.spinner("데이터 수집 중..."):
-                rpt.collect()
-            with st.spinner("차트 구성 중..."):
-                rpt.build_charts()
-            st.session_state.rpt = rpt
+        st.session_state.report_ready = False  # Reset
+        main_rpt = ReportBuilder(ticker=ticker, days=days, beta=beta, years=years, use_dart=use_dart)
+        if main_rpt.validate():
+            with st.spinner("메인 보고서 데이터 수집 중..."):
+                main_rpt.collect()
+                main_rpt.build_charts()
+            st.session_state.rpt = main_rpt
             st.session_state.report_ready = True
         else:
-            for e in rpt.errors:
-                st.error(e)
+            for e in main_rpt.errors:
+                st.error(f"메인 보고서 오류: {e}")
 
-    # 제출 여부와 관계없이, 세션의 보고서를 항상 렌더
+        st.session_state.aux_rpt = None
+        if use_aux_chart and st.session_state.report_ready:
+            # 보조 리포트는 DART 분석을 제외하여 빠르게 생성
+            aux_rpt = ReportBuilder(ticker=ticker, days=aux_days, beta=beta, years=years, use_dart=False)
+            if aux_rpt.validate():
+                with st.spinner(f"{aux_days}일 보조 보고서 생성 중..."):
+                    aux_rpt.collect()
+                    aux_rpt.build_charts()
+                st.session_state.aux_rpt = aux_rpt
+            else:
+                for e in aux_rpt.errors:
+                    st.error(f"보조 보고서 오류: {e}")
+
+    # --- 렌더링 ---
     if st.session_state.report_ready and st.session_state.rpt:
-        rpt = st.session_state.rpt
-        rpt.render()
+        main_rpt = st.session_state.rpt
+        aux_rpt = st.session_state.get("aux_rpt")
 
+        # 1. 개요는 메인 리포트 기준으로 한 번만 표시
+        main_rpt.render_overview()
+
+        # 2. 차트는 좌우로 나란히 표시
+        if aux_rpt:
+            col1, col2 = st.columns(2)
+            with col1:
+                main_rpt.render_charts()
+            with col2:
+                aux_rpt.render_charts()
+        else:
+            main_rpt.render_charts()
+
+        # 3. 나머지 상세 정보는 메인 리포트 기준으로 표시
+        st.markdown("---")
+        main_rpt.render_valuation()
+        st.markdown("---")
+        main_rpt.render_financials()
+        st.markdown("---")
+        main_rpt.render_appendix()
+        st.markdown("---")
+        main_rpt.render_logs()
+
+        # 내보내기 버튼은 메인 보고서 기준
         st.markdown("---")
         st.subheader("🖨️ 보고서 내보내기")
         col1, col2 = st.columns([1, 3])
         with col1:
             if st.button("PDF/HTML 저장", key="export_btn", use_container_width=True):
-                out = rpt.export()
+                out = main_rpt.export()
                 if out and out.exists():
                     st.success(f"저장 완료: {out.name}")
                     try:

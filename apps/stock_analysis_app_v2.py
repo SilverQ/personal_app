@@ -789,7 +789,7 @@ class ReportBuilder:
                     fig1 = go.Figure()
                     for c in valid:
                         fig1.add_trace(go.Bar(x=self.inv_df.index, y=self.inv_df[c], name=c))
-                    fig1.update_layout(title="투자자별 순매수 추이", height=300, hovermode="x unified", barmode='relative', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    fig1.update_layout(title=f"투자자별 순매수 추이 - {self.days}일", height=300, hovermode="x unified", barmode='relative', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                     set_rangebreaks(fig1, self.inv_df)
                     self.fig_flow = fig1
 
@@ -952,40 +952,29 @@ class ReportBuilder:
         # kaleido 없으면 HTML만 반환
         return html_path
 
-    # ---------- 렌더 ----------
     # ---------- 렌더 (컴포넌트화) ----------
     def render_overview(self):
-        st.subheader("📌 개요")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric("종목명", self.ticker_name)
-        with c2: st.metric("종목코드", self.ticker)
-        with c3: st.metric("분석기간(영업일)", f"{self.days}")
-        with c4:
-            if hasattr(self, "_price_info") and self._price_info:
-                st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A",
-                          help=f"최근일(잠정) 종가: {self._price_info['latest_close']:,.0f}원 ({self._price_info['latest_date']}) | 확정 종가: {self._price_info['settled_close']:,.0f}원 ({self._price_info['settled_date']})")
+        st.subheader("📌 개요 및 밸류에이션")
+        
+        # First row: Basic Info & Valuation
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            st.markdown(f"### {self.ticker_name} ({self.ticker})")
+        with c2:
+            st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A")
+        with c3:
+            if self.srim and self.current_price:
+                fair = self.srim["intrinsic_value"]
+                pct = (fair - self.current_price) / self.current_price * 100
+                st.metric("현재가 대비", f"{pct:+.1f}%")
             else:
-                st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A")
+                st.metric("현재가 대비", "N/A")
 
-    def render_charts(self):
-        st.subheader("📈 종합 차트")
-        # 요청에 따라 주가, 누적 수급, 일별 수급 차트를 세로로 배열합니다.
-        # 각 차트의 x축은 휴일/주말이 제외되어 연속적으로 표시됩니다.
-        if self.fig_price:
-            st.plotly_chart(self.fig_price, use_container_width=True)
-        if self.fig_flow_cum:
-            st.plotly_chart(self.fig_flow_cum, use_container_width=True)
-        if self.fig_flow:
-            st.plotly_chart(self.fig_flow, use_container_width=True)
+        st.markdown("---")
 
-        # 모든 차트 데이터가 없는 경우에만 메시지 표시
-        if not self.fig_price and not self.fig_flow:
-             st.info("차트 데이터를 불러오지 못했습니다.")
-
-    def render_valuation(self):
-        st.subheader("💰 밸류에이션 요약 (DCF/S-RIM)")
+        # Second row: Valuation metrics
         if self.dcf or self.srim:
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             with c1:
                 if self.dcf:
                     st.metric("DCF EV(억원)", f"{self.dcf['enterprise_value']:,.0f}")
@@ -998,19 +987,23 @@ class ReportBuilder:
                     st.caption(f"ROE {self.srim['sustainable_roe']:.2%} | r {self.srim['required_return']:.2%}")
                 else:
                     st.metric("S-RIM 적정가", "N/A")
-            with c3:
-                if self.srim and self.current_price:
-                    fair = self.srim["intrinsic_value"]
-                    pct = (fair - self.current_price) / self.current_price * 100
-                    st.metric("현재가 대비", f"{pct:+.1f}%")
-                else:
-                    st.metric("현재가 대비", "N/A")
-            with st.expander("DCF 상세"):
-                st.json(self.dcf or {"info": "데이터 없음"})
-            with st.expander("S-RIM 상세"):
-                st.json(self.srim or {"info": "데이터 없음"})
         else:
             st.info("밸류에이션을 계산할 충분한 데이터가 없습니다.")
+
+    def render_charts(self):
+        st.subheader(f"📈 종합 차트 ({self.days}일)")
+        # 요청에 따라 주가, 누적 수급, 일별 수급 차트를 세로로 배열합니다.
+        # 각 차트의 x축은 휴일/주말이 제외되어 연속적으로 표시됩니다.
+        if self.fig_price:
+            st.plotly_chart(self.fig_price, use_container_width=True)
+        if self.fig_flow_cum:
+            st.plotly_chart(self.fig_flow_cum, use_container_width=True)
+        if self.fig_flow:
+            st.plotly_chart(self.fig_flow, use_container_width=True)
+
+        # 모든 차트 데이터가 없는 경우에만 메시지 표시
+        if not self.fig_price and not self.fig_flow:
+             st.info("차트 데이터를 불러오지 못했습니다.")
 
     def render_financials(self):
         st.subheader("📊 재무 지표(요약)")
@@ -1035,6 +1028,8 @@ class ReportBuilder:
                 st.dataframe(tmp, use_container_width=True)
             else:
                 st.write("N/A")
+        with st.expander("DCF/S-RIM 상세 정보"):
+            st.json({"DCF": self.dcf or "데이터 없음", "SRIM": self.srim or "데이터 없음"})
 
     def render_logs(self):
         with st.expander("🔧 진단 로그 (수집/계산 과정)", expanded=True):
@@ -1056,26 +1051,10 @@ class ReportBuilder:
             else:
                 st.write("로그가 없습니다.")
 
-    def render(self):
-        for m in self.warnings:
-            st.warning(m)
-        self.render_overview()
-        st.markdown("---")
-        self.render_charts()
-        st.markdown("---")
-        self.render_valuation()
-        st.markdown("---")
-        self.render_financials()
-        st.markdown("---")
-        self.render_appendix()
-        st.markdown("---")
-        self.render_logs()
-
 
 # =============================
 # Streamlit 진입점(메인에서 호출)
 # =============================
-
 def run():
     # rerun에도 보고서를 유지하기 위해 세션 상태 사용
     if "rpt" not in st.session_state:
@@ -1089,34 +1068,52 @@ def run():
 
     @st.cache_data
     def get_stock_list():
-        """pykrx에서 전체 종목 리스트를 조회하고 캐시합니다."""
-        if not PYKRX_AVAILABLE: return {}
+        """pykrx에서 전체 종목 리스트를 조회하고, UI 표시용 리스트와 티커 매핑을 반환합니다."""
+        if not PYKRX_AVAILABLE: return [], {}
         try:
             tickers = stock.get_market_ticker_list(market="KOSPI") + stock.get_market_ticker_list(market="KOSDAQ")
-            names = stock.get_market_ticker_name(tickers)
-            name_map = {name: ticker for ticker, name in names.items() if name}
-            return dict(sorted(name_map.items()))
-        except Exception:
-            return {}
+            name_map = stock.get_market_ticker_name(tickers)
+            
+            formatted_list = []
+            ticker_map = {}
+            
+            # 이름으로 정렬
+            sorted_items = sorted(name_map.items(), key=lambda item: item[1])
 
-    stock_map = get_stock_list()
-    stock_names = list(stock_map.keys())
+            for ticker, name in sorted_items:
+                if name:  # 이름이 있는 경우에만 추가
+                    formatted_string = f"{name} ({ticker})"
+                    formatted_list.append(formatted_string)
+                    ticker_map[formatted_string] = ticker
+            
+            return formatted_list, ticker_map
+        except Exception as e:
+            st.error(f"종목 리스트 로딩 실패: {e}")
+            return [], {}
+
+    stock_list_for_ui, ticker_map = get_stock_list()
 
     # 메인 앱 사이드바를 침범하지 않도록, 본문 상단 컨트롤 패널 사용
     with st.container():
         with st.form("controls"):
             st.subheader("⚙️ 분석 설정")
-            c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
+            c1, c2, c3, c4 = st.columns([2, 1, 1, 1]) # 검색창 넓게
             with c1:
-                if stock_names:
+                if stock_list_for_ui:
                     try:
-                        samsung_idx = stock_names.index("삼성전자")
-                    except ValueError:
-                        samsung_idx = 0
-                    selected_name = st.selectbox("종목명", options=stock_names, index=samsung_idx)
-                    ticker = stock_map[selected_name]
+                        samsung_str = next((s for s in stock_list_for_ui if s.startswith("삼성전자")), stock_list_for_ui[0])
+                        default_index = stock_list_for_ui.index(samsung_str)
+                    except (ValueError, IndexError):
+                        default_index = 0
+                    
+                    selected_formatted_string = st.selectbox(
+                        "종목명 또는 종목코드 검색", 
+                        options=stock_list_for_ui, 
+                        index=default_index
+                    )
+                    ticker = ticker_map[selected_formatted_string]
                 else:
-                    ticker = st.text_input("종목 코드", value="005930", help="예: 005930 (삼성전자)")
+                    ticker = st.text_input("종목 코드", value="005930", help="예: 005930 (삼성전자). 종목 리스트 로딩에 실패했습니다.")
             with c2:
                 days = st.slider("메인 기간(일)", 7, 730, 90, step=1)
             with c3:
@@ -1163,7 +1160,7 @@ def run():
         main_rpt = st.session_state.rpt
         aux_rpt = st.session_state.get("aux_rpt")
 
-        # 1. 개요는 메인 리포트 기준으로 한 번만 표시
+        # 1. 개요 및 밸류에이션은 메인 리포트 기준으로 한 번만 표시
         main_rpt.render_overview()
 
         # 2. 차트는 좌우로 나란히 표시
@@ -1177,8 +1174,6 @@ def run():
             main_rpt.render_charts()
 
         # 3. 나머지 상세 정보는 메인 리포트 기준으로 표시
-        st.markdown("---")
-        main_rpt.render_valuation()
         st.markdown("---")
         main_rpt.render_financials()
         st.markdown("---")

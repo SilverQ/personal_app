@@ -1,7 +1,8 @@
 import streamlit as st
 
-import mahalanobis_distance_app
-from apps import (currency_app, dummy_app, stock_analysis_app, stock_analysis_app_v2) # 각 앱을 모듈로 분리
+# import mahalanobis_distance_app
+from apps import (currency_app, dummy_app, stock_analysis_app, stock_analysis_app_v2,
+                  mahalanobis_distance_app)  # 각 앱을 모듈로 분리
 # from apps import chat
 
 # 🎯 와이드 레이아웃 설정 (이 부분 추가!)

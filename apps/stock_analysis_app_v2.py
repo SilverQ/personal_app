@@ -1,14 +1,4 @@
-"""
-stock_analysis_app_v2 (리팩터링 + 진단 로그 강화)
-- 메인 앱의 사이드바를 사용하지 않는 서브앱 버전
-- 상단 컨트롤 패널(본문 영역)에서 1회 입력 → 단일 종합 보고서 렌더
-- ReportBuilder 클래스로 수집/검증/시각화/내보내기 일원화
-- DART 기반 재무/밸류에이션(옵션), PyKrx 기반 가격/수급
-- PDF(ReportLab+Kaleido) 또는 HTML 자동 내보내기
-- 🔧 어디서 실패했는지 알 수 있도록 단계별 진단 로그 출력
-
-주의: set_page_config는 메인에서만 호출합니다.
-"""
+"stock_analysis_app_v2 (리팩터링 + 진단 로그 강화)\n- 메인 앱의 사이드바를 사용하지 않는 서브앱 버전\n- 상단 컨트롤 패널(본문 영역)에서 1회 입력 → 단일 종합 보고서 렌더\n- ReportBuilder 클래스로 수집/검증/시각화/내보내기 일원화\n- DART 기반 재무/밸류에이션(옵션), PyKrx 기반 가격/수급\n- PDF(ReportLab+Kaleido) 또는 HTML 자동 내보내기\n- 🔧 어디서 실패했는지 알 수 있도록 단계별 진단 로그 출력\n\n주의: set_page_config는 메인에서만 호출합니다.\n"
 
 from __future__ import annotations
 
@@ -30,9 +20,7 @@ from datetime import timezone
 
 warnings.filterwarnings("ignore")
 
-# =============================
-# 환경 설정/외부 라이브러리 체크
-# =============================
+# =============================\n# 환경 설정/외부 라이브러리 체크\n# =============================
 IS_DEBUG = False
 
 CONFIG = configparser.ConfigParser()
@@ -46,9 +34,7 @@ try:
 except Exception as _e:
     PYKRX_AVAILABLE = False
 
-# OpenDartReader는 배포 버전에 따라 생성자 접근 방식이 다릅니다.
-# - 어떤 환경: from OpenDartReader import OpenDartReader; OpenDartReader(api_key)
-# - 다른 환경: import OpenDartReader; OpenDartReader.OpenDartReader(api_key)
+# OpenDartReader는 배포 버전에 따라 생성자 접근 방식이 다릅니다.\n# - 어떤 환경: from OpenDartReader import OpenDartReader; OpenDartReader(api_key)\n# - 다른 환경: import OpenDartReader; OpenDartReader.OpenDartReader(api_key)
 try:
     import OpenDartReader as _odr_module  # 모듈로 임포트 시도
     if hasattr(_odr_module, "OpenDartReader"):
@@ -83,8 +69,7 @@ except Exception:
 
 import plotly.io as pio
 
-# =============================
-# 캐시/헬퍼
+# =============================\n# 캐시/헬퍼
 # =============================
 CACHE_DIR = Path("./cache"); CACHE_DIR.mkdir(exist_ok=True)
 SIMPLE_CACHE = Path("simple_trading_cache.pkl")
@@ -232,8 +217,7 @@ def _latest_prices(ticker: str, log=None):
         return None
 
 
-# =============================
-# DART 수집 & 모델 (견고화)
+# =============================\n# DART 수집 & 모델 (견고화)
 # =============================
 class DartDataCollector:
     def __init__(self, api_key: str | None, log=None):
@@ -354,7 +338,7 @@ class DCFModel:
         s = s.replace(",", "")
         m = re.match(r"^-?\d+(\.\d+)?$", s)
         if not m:
-            digits = re.sub(r"[^0-9\.\-]", "", s)
+            digits = re.sub(r"[^0-9\.\-ről]", "", s)
             if digits in ("", "-", "."):
                 return None
             s = digits
@@ -444,9 +428,9 @@ class DCFModel:
                         else:
                             log("debug", "METRIC_MATCH", f"{tag} 매칭",
                                 year=y,
-                                account_id=str(row.get("account_id", "")),
-                                account_nm=str(row.get("account_nm", "")),
-                                thstrm=str(row.get("thstrm_amount", "")))
+                                account_id=str(row.get("account_id", "")) if row.get("account_id") else "",
+                                account_nm=str(row.get("account_nm", "")) if row.get("account_nm") else "",
+                                thstrm=str(row.get("thstrm_amount", "")) if row.get("thstrm_amount") else "")
                     _log_row("revenue", rev_row)
                     _log_row("ebit", ebit_row)
                     _log_row("net_income", net_row)
@@ -563,8 +547,7 @@ class SRIMModel:
         }
 
 
-# =============================
-# ReportBuilder (+ 진단 로그)
+# =============================\n# ReportBuilder (+ 진단 로그)
 # =============================
 class ReportBuilder:
     def __init__(self, ticker: str, days: int, beta: float, years: int, use_dart: bool):
@@ -587,6 +570,86 @@ class ReportBuilder:
         self.fig_price = None
         self.fig_flow = None
         self.fig_flow_cum = None
+        self.comprehensive_analysis: str | None = None  # 종합 분석 결과
+
+    def _generate_comprehensive_analysis(self) -> str:
+        """
+        수집된 데이터를 바탕으로 주가, 수급, 밸류에이션을 종합적으로 분석합니다.
+        """
+        analysis_points = []
+        positive_signals = 0
+
+        # 1. 주가 수준 분석
+        if self.price_df is not None and not self.price_df.empty and self.current_price is not None:
+            recent_high = self.price_df['고가'].max()
+            recent_low = self.price_df['저가'].min()
+            if recent_high > recent_low:
+                position = (self.current_price - recent_low) / (recent_high - recent_low)
+                if position < 0.2:  # 하위 20% 수준
+                    analysis_points.append(f"현재 주가는 최근 {self.days}일 가격대 중 하위 20% 수준으로, 단기적인 가격 매력이 있습니다.")
+                    positive_signals += 1
+                elif position > 0.8: # 상위 20% 수준
+                    analysis_points.append(f"현재 주가는 최근 {self.days}일 가격대 중 상위 20% 수준으로, 단기 과열에 대한 주의가 필요합니다.")
+                else:
+                    analysis_points.append(f"현재 주가는 최근 {self.days}일 가격대의 약 {position:.0%} 지점에 위치해 있습니다.")
+
+        # 2. 수급 분석
+        if self.inv_df is not None and len(self.inv_df) > 5:
+            # 최근 5일간의 순매수 합계
+            last_5d_net = self.inv_df.tail(5).sum()
+            foreign_net = last_5d_net.get('외국인', 0)
+            inst_net = last_5d_net.get('기관합계', 0)
+            retail_net = last_5d_net.get('개인', 0)
+            
+            if foreign_net > 0 and inst_net > 0 and retail_net < 0:
+                analysis_points.append("최근 5일간 외국인과 기관의 동반 순매수세가 유입되는 가운데 개인은 매도하여, 수급이 매우 긍정적입니다.")
+                positive_signals += 2 # 동반 매수는 강력한 신호
+            elif foreign_net > 0 and retail_net < 0:
+                analysis_points.append("최근 외국인의 매수세가 유입되고 개인이 매도하는 경향을 보여, 수급이 긍정적입니다.")
+                positive_signals += 1
+            elif inst_net > 0 and retail_net < 0:
+                analysis_points.append("최근 기관의 매수세가 유입되고 개인이 매도하는 경향을 보여, 수급이 양호합니다.")
+                positive_signals += 1
+            elif foreign_net < 0 and inst_net < 0 and retail_net > 0:
+                analysis_points.append("최근 외국인과 기관이 동반 순매도하고 개인이 매수하는 경향을 보여, 단기 수급 부담이 매우 큽니다.")
+
+        # 3. 밸류에이션 분석
+        is_undervalued = False
+        if self.srim and self.srim.get('intrinsic_value') and self.current_price:
+            iv = self.srim['intrinsic_value']
+            undervalued_pct = (iv - self.current_price) / self.current_price
+            if undervalued_pct > 0.25:  # 25% 이상 저평가
+                analysis_points.append(f"S-RIM 모델 기준 적정주가는 약 {iv:,.0f}원으로, 현재보다 {undervalued_pct:.1%} 높은 수준의 저평가 상태입니다.")
+                is_undervalued = True
+                positive_signals += 1
+            elif undervalued_pct < -0.25:
+                analysis_points.append(f"S-RIM 모델 기준 적정주가는 약 {iv:,.0f}원으로, 현재보다 {abs(undervalued_pct):.1%} 낮은 수준의 고평가 상태입니다.")
+
+        # 4. 종합 의견 및 추천
+        if not analysis_points:
+            return "분석할 데이터가 부족하여 종합 의견을 도출할 수 없습니다."
+
+        recommendation = "중립"
+        if is_undervalued and positive_signals >= 2:
+            recommendation = "긍정적 매수 검토"
+        elif positive_signals >= 2:
+            recommendation = "긍정적"
+        elif positive_signals == 0 and not is_undervalued:
+            recommendation = "보수적 접근 필요"
+        
+        summary = "\n".join(f"- {point}" for point in analysis_points)
+        summary += f"\n\n**종합 의견:** 위의 분석들을 종합해 볼 때, 현 시점 투자 매력도에 대한 의견은 **'{recommendation}'** 입니다."
+        
+        return summary
+
+    def run_comprehensive_analysis(self):
+        self._log("info", "COMP_ANALYSIS", "종합 분석 시작")
+        try:
+            self.comprehensive_analysis = self._generate_comprehensive_analysis()
+            self._log("info", "COMP_ANALYSIS", "종합 분석 완료")
+        except Exception as e:
+            self._log("error", "COMP_ANALYSIS", "종합 분석 중 오류 발생", error=str(e))
+            self.comprehensive_analysis = "종합 분석 중 오류가 발생했습니다."
 
     # ---------- 로깅 유틸 ----------
     def _log(self, level: str, stage: str, msg: str, **ctx):
@@ -656,41 +719,39 @@ class ReportBuilder:
         try:
             px = _latest_prices(self.ticker, log=self._log)
             if px:
-                # 현재가는 ‘확정 종가’로 표시(밤/장중에도 일관됨)
                 self.current_price = px["settled_close"]
-                # 원한다면 보고서 개요에 잠정가도 별도 표기 가능
-                self._price_info = px  # (필드 추가해 렌더에서 활용 가능)
+                self._price_info = px
             else:
                 self._log("warning", "PRICE_NOW", "가격 정보 산출 실패")
         except Exception as ex:
             self._log("error", "PRICE_NOW", "현재가 조회 예외", error=str(ex), tb=traceback.format_exc())
+        
         # DART
         if self.use_dart and DART_KEY:
             dart = DartDataCollector(DART_KEY, log=self._log)
-            self.company = dart.company(self.ticker)  # 표시용
+            self.company = dart.company(self.ticker)
             corp = (self.company or {}).get("corp_code")
             if corp:
                 fs_map = dart.fin_map(corp, years=self.years)
                 try:
                     dcf_model = DCFModel()
-                    # 재무 지표 추출
                     self.metrics = dcf_model.extract_metrics(fs_map, log=self._log)
                     if not self.metrics:
                         self._log("warning", "METRICS", "재무 지표 추출 결과 없음")
                     else:
-                        sums = {k: sum((v.get(k, 0.0) or 0.0) for v in self.metrics.values())
+                        sums = {k: sum((v.get(k, 0.0) or 0.0) for v in self.metrics.values()) 
                                 for k in ["revenue", "ebit", "net_income", "total_assets", "total_equity", "operating_cf"]}
                         self._log("info", "METRICS_SUM", "지표 합계(억원)", **sums)
                         if sums["revenue"] == 0.0:
                             self._log("error", "METRICS_ZERO", "매출액 합계가 0 → 파싱 실패 가능(계정명/ID/하이픈/단위)")
-                    # DCF
+                    
                     self.dcf = dcf_model.value(self.metrics or {}, beta=self.beta, years=self.years, window=min(self.years, 5))
                     self._log("info", "ASSUMPTIONS", "DCF 파라미터", years=self.years, window=min(self.years, 5))
                     if self.dcf is None:
                         self._log("warning", "DCF", "DCF 계산 실패 또는 데이터 부족(기저 매출=0)")
                     else:
                         self._log("info", "DCF", "DCF 계산 완료", EV_억원=round(self.dcf["enterprise_value"], 0))
-                    # BPS 계산 (S-RIM용)
+                    
                     calculated_bps = None
                     try:
                         cap_df = stock.get_market_cap_by_date(s, e, self.ticker)
@@ -701,7 +762,6 @@ class ReportBuilder:
                                 latest_year = sorted(self.metrics.keys())[-1]
                                 latest_equity = self.metrics[latest_year].get("total_equity")
                                 if latest_equity and latest_equity > 0 and num_shares > 0:
-                                    # 자본총계 단위: 억원
                                     calculated_bps = (latest_equity * 100_000_000) / num_shares
                                     self._log("info", "BPS_CALC", "BPS 계산 완료", bps=round(calculated_bps, 2), equity_억원=latest_equity, shares=num_shares)
                                 else:
@@ -711,7 +771,6 @@ class ReportBuilder:
                     except Exception as ex:
                         self._log("error", "BPS_CALC", "BPS 계산 중 예외 발생", error=str(ex))
 
-                    # SRIM
                     sr = SRIMModel(); parts = sr.roe_parts(self.metrics or {})
                     if not parts:
                         self._log("warning", "SRIM", "ROE 분해 결과 없음")
@@ -728,15 +787,17 @@ class ReportBuilder:
                 self._log("warning", "DART", "corp_code 미확보 → DART 재무 수집 생략")
         else:
             self._log("info", "DART", "DART 비사용 경로")
+        
+        # 종합 분석 기능 호출
+        self.run_comprehensive_analysis()
+        
         self._log("info", "COLLECT", "수집 종료")
 
     # ---------- 차트 ----------
     def build_charts(self):
-        # 공통 x축(시간) 처리를 위해 모든 차트를 여기서 한 번에 생성
         price_ok = self.price_df is not None and not self.price_df.empty
         inv_ok = self.inv_df is not None and not self.inv_df.empty
 
-        # 휴일/주말 제외 로직
         def set_rangebreaks(fig, df):
             if df is None or df.empty:
                 return
@@ -744,7 +805,6 @@ class ReportBuilder:
             missing_days = all_days.difference(df.index)
             fig.update_xaxes(rangebreaks=[dict(values=missing_days.strftime('%Y-%m-%d'))])
 
-        # 1. 주가 차트
         try:
             if price_ok:
                 fig = go.Figure()
@@ -755,13 +815,13 @@ class ReportBuilder:
                     low=self.price_df.get("저가"),
                     close=self.price_df.get("종가"),
                     name="주가",
-                    increasing=dict(line_color="#D60000", fillcolor="#D60000"),  # HTS 빨간색
-                    decreasing=dict(line_color="#0051D6", fillcolor="#0051D6"),  # HTS 파란색
+                    increasing=dict(line_color="#D60000", fillcolor="#D60000"),
+                    decreasing=dict(line_color="#0051D6", fillcolor="#0051D6"),
                 ))
                 fig.update_layout(
                     title=f"{self.ticker_name} ({self.ticker}) 주가",
                     height=400,
-                    xaxis_rangeslider_visible=False  # 슬라이더는 하단 차트와 중복되므로 제거
+                    xaxis_rangeslider_visible=False
                 )
                 set_rangebreaks(fig, self.price_df)
                 self.fig_price = fig
@@ -771,12 +831,10 @@ class ReportBuilder:
         except Exception as ex:
             self._log("error", "CHART", "가격 차트 생성 실패", error=str(ex), tb=traceback.format_exc())
 
-        # 2. 수급 차트 (누적, 일별)
         try:
             if inv_ok:
                 valid = [c for c in ["개인", "기관합계", "외국인", "기타법인"] if c in self.inv_df.columns]
                 if valid:
-                    # 누적 순매수
                     fig2 = go.Figure()
                     cum = self.inv_df[valid].fillna(0).cumsum()
                     for c in valid:
@@ -785,7 +843,6 @@ class ReportBuilder:
                     set_rangebreaks(fig2, self.inv_df)
                     self.fig_flow_cum = fig2
 
-                    # 일별 순매수 (Bar 차트로 변경)
                     fig1 = go.Figure()
                     for c in valid:
                         fig1.add_trace(go.Bar(x=self.inv_df.index, y=self.inv_df[c], name=c))
@@ -808,12 +865,10 @@ class ReportBuilder:
         base = f"report_{self.ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         html_path = out_dir / f"{base}.html"
 
-        # ---------- HTML (항상 생성, 풀 콘텐츠) ----------
         try:
             parts = []
-            # 헤더 + 간단 스타일
             parts.append("""
-            <html><head><meta charset="utf-8">
+            <html><head><meta charset=\"utf-8\">
             <style>
               body{font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans KR', Arial, sans-serif; margin:24px;}
               h1,h2,h3{margin: 8px 0;}
@@ -828,7 +883,6 @@ class ReportBuilder:
             """)
             parts.append(f"<h2>종합 보고서: {self.ticker_name} ({self.ticker})</h2>")
             parts.append(f"<p>생성일: {datetime.now():%Y-%m-%d %H:%M}</p>")
-            # KPI
             parts.append('<div class="kpi">')
             parts.append(
                 f"<div>현재가: <b>{self.current_price:,.0f}원</b></div>" if self.current_price else "<div>현재가: N/A</div>")
@@ -839,7 +893,9 @@ class ReportBuilder:
                 parts.append(f"<div>S-RIM 적정가(원/주): <b>{self.srim['intrinsic_value']:,.0f}</b></div>")
             parts.append("</div>")
 
-            # 차트(인터랙티브) — 첫 차트만 plotly.js 포함
+            if self.comprehensive_analysis:
+                parts.append(f'<div class="section"><h3>종합 분석</h3><p>{self.comprehensive_analysis.replace("\n", "<br>")}</p></div>')
+
             figs = [f for f in [self.fig_price, self.fig_flow, self.fig_flow_cum] if f is not None]
             if figs:
                 parts.append('<div class="section"><h3>차트</h3>')
@@ -851,22 +907,19 @@ class ReportBuilder:
                     first = False
                 parts.append("</div>")
 
-            # 재무 표
             if self.metrics:
                 df = pd.DataFrame(self.metrics).T.round(0)
                 parts.append('<div class="section"><h3>재무 지표(요약)</h3>')
                 parts.append(df.to_html(border=0, justify="right"))
                 parts.append("</div>")
 
-            # 수급 표
             if self.inv_df is not None and not self.inv_df.empty:
                 tmp = self.inv_df.copy();
                 tmp.index = tmp.index.strftime('%Y-%m-%d')
                 parts.append('<div class="section"><h3>투자자별 순매수(일별)</h3>')
-                parts.append(tmp.tail(60).to_html(border=0))  # 최근 60일만
+                parts.append(tmp.tail(60).to_html(border=0))
                 parts.append("</div>")
 
-            # 디테일 JSON(선택)
             if self.dcf or self.srim:
                 parts.append('<div class="section"><h3>밸류에이션 상세</h3>')
                 if self.dcf:
@@ -882,7 +935,6 @@ class ReportBuilder:
             self._log("error", "EXPORT", "HTML 저장 실패", error=str(ex), tb=traceback.format_exc())
             return None
 
-        # ---------- PDF (kaleido 있을 때만 이미지 삽입) ----------
         if REPORTLAB_AVAILABLE and KALEIDO_AVAILABLE:
             pdf_path = out_dir / f"{base}.pdf"
             try:
@@ -893,7 +945,6 @@ class ReportBuilder:
                 w, h = A4;
                 y = h - 2 * cm
 
-                # (선택) 한글 폰트 등록
                 try:
                     from reportlab.pdfbase import pdfmetrics
                     from reportlab.pdfbase.ttfonts import TTFont
@@ -921,8 +972,16 @@ class ReportBuilder:
                 if self.srim:
                     c.drawString(2 * cm, y, f"S-RIM 적정가(원/주): {self.srim['intrinsic_value']:,.0f}");
                     y -= 0.8 * cm
+                
+                if self.comprehensive_analysis:
+                    from reportlab.platypus import SimpleDocTemplate, Paragraph
+                    from reportlab.lib.styles import getSampleStyleSheet
+                    styles = getSampleStyleSheet()
+                    p = Paragraph(self.comprehensive_analysis.replace('\n', '<br/>'), styles['BodyText'])
+                    p.wrapOn(c, w - 4*cm, h)
+                    p.drawOn(c, 2*cm, y - p.height)
+                    y -= (p.height + 0.6*cm)
 
-                # 차트 이미지를 순서대로 추가
                 def draw_fig(fig, yy):
                     img = out_dir / f"{base}_{np.random.randint(1e9)}.png"
                     pio.write_image(fig, str(img), width=1000, height=520, scale=2)
@@ -943,20 +1002,17 @@ class ReportBuilder:
                 c.showPage();
                 c.save()
                 self._log("info", "EXPORT", "PDF 저장 완료", path=str(pdf_path))
-                return pdf_path  # PDF 우선 반환
+                return pdf_path
             except Exception as ex:
                 self._log("error", "EXPORT", "PDF 저장 실패", error=str(ex), tb=traceback.format_exc())
-                # 실패해도 HTML은 이미 만들어졌으니 HTML 경로 반환
                 return html_path
 
-        # kaleido 없으면 HTML만 반환
         return html_path
 
     # ---------- 렌더 (컴포넌트화) ----------
     def render_overview(self):
         st.subheader("📌 개요 및 밸류에이션")
         
-        # First row: Basic Info & Valuation
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
             st.markdown(f"### {self.ticker_name} ({self.ticker})")
@@ -964,7 +1020,7 @@ class ReportBuilder:
             st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A")
         with c3:
             if self.srim and self.current_price:
-                fair = self.srim["intrinsic_value"]
+                fair = self.srim['intrinsic_value']
                 pct = (fair - self.current_price) / self.current_price * 100
                 st.metric("현재가 대비", f"{pct:+.1f}%")
             else:
@@ -972,7 +1028,6 @@ class ReportBuilder:
 
         st.markdown("---")
 
-        # Second row: Valuation metrics
         if self.dcf or self.srim:
             c1, c2 = st.columns(2)
             with c1:
@@ -990,10 +1045,15 @@ class ReportBuilder:
         else:
             st.info("밸류에이션을 계산할 충분한 데이터가 없습니다.")
 
+        st.markdown("---")
+        st.subheader("🔍 종합 분석 (Gemini 분석)")
+        if self.comprehensive_analysis:
+            st.markdown(self.comprehensive_analysis, unsafe_allow_html=True)
+        else:
+            st.info("종합 분석 정보가 없습니다.")
+
     def render_charts(self):
         st.subheader(f"📈 종합 차트 ({self.days}일)")
-        # 요청에 따라 주가, 누적 수급, 일별 수급 차트를 세로로 배열합니다.
-        # 각 차트의 x축은 휴일/주말이 제외되어 연속적으로 표시됩니다.
         if self.fig_price:
             st.plotly_chart(self.fig_price, use_container_width=True)
         if self.fig_flow_cum:
@@ -1001,7 +1061,6 @@ class ReportBuilder:
         if self.fig_flow:
             st.plotly_chart(self.fig_flow, use_container_width=True)
 
-        # 모든 차트 데이터가 없는 경우에만 메시지 표시
         if not self.fig_price and not self.fig_flow:
              st.info("차트 데이터를 불러오지 못했습니다.")
 
@@ -1052,118 +1111,122 @@ class ReportBuilder:
                 st.write("로그가 없습니다.")
 
 
+# =============================\n# Streamlit 진입점(메인에서 호출)
 # =============================
-# Streamlit 진입점(메인에서 호출)
-# =============================
+@st.cache_data
+def get_stock_list():
+    """로컬 stock_list.csv 파일에서 종목 리스트를 불러옵니다."""
+    file_path = "./apps/stock_list.csv"
+    if not os.path.exists(file_path):
+        st.error(f"'{file_path}' 파일이 없습니다. 먼저 `update_stock_list.py`를 실행하여 종목 리스트를 생성해주세요.")
+        return []
+    try:
+        df = pd.read_csv(file_path)
+        # 이름으로 정렬
+        df = df.sort_values(by="name")
+        # "종목명 (코드)" 형식으로 포맷. 코드는 6자리로 맞춤
+        formatted_list = [f"{row['name']} ({str(row['code']).zfill(6)})".replace("\n", " ") for index, row in df.iterrows()]
+        return formatted_list
+    except Exception as e:
+        st.error(f"'{file_path}' 파일 로딩 중 오류 발생.")
+        st.exception(e)
+        return []
+
 def run():
-    # rerun에도 보고서를 유지하기 위해 세션 상태 사용
+    # --- 상태 초기화 ---
+    if "report_ready" not in st.session_state:
+        st.session_state.report_ready = False
     if "rpt" not in st.session_state:
         st.session_state.rpt = None
     if "aux_rpt" not in st.session_state:
         st.session_state.aux_rpt = None
-    if "report_ready" not in st.session_state:
-        st.session_state.report_ready = False
 
     st.title("📊 주식 분석 (종합 보고서)")
 
-    @st.cache_data
-    def get_stock_list():
-        """pykrx에서 전체 종목 리스트를 조회하고, UI 표시용 리스트와 티커 매핑을 반환합니다."""
-        if not PYKRX_AVAILABLE: return [], {}
-        try:
-            tickers = stock.get_market_ticker_list(market="KOSPI") + stock.get_market_ticker_list(market="KOSDAQ")
-            name_map = stock.get_market_ticker_name(tickers)
-            
-            formatted_list = []
-            ticker_map = {}
-            
-            # 이름으로 정렬
-            sorted_items = sorted(name_map.items(), key=lambda item: item[1])
+    # --- 데이터 로딩 ---
+    stock_list_for_ui = get_stock_list()
 
-            for ticker, name in sorted_items:
-                if name:  # 이름이 있는 경우에만 추가
-                    formatted_string = f"{name} ({ticker})"
-                    formatted_list.append(formatted_string)
-                    ticker_map[formatted_string] = ticker
-            
-            return formatted_list, ticker_map
-        except Exception as e:
-            st.error(f"종목 리스트 로딩 실패: {e}")
-            return [], {}
+    # --- 컨트롤 폼 ---
+    with st.form("analysis_controls"):
+        st.subheader("⚙️ 분석 설정")
+        
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
 
-    stock_list_for_ui, ticker_map = get_stock_list()
-
-    # 메인 앱 사이드바를 침범하지 않도록, 본문 상단 컨트롤 패널 사용
-    with st.container():
-        with st.form("controls"):
-            st.subheader("⚙️ 분석 설정")
-            c1, c2, c3, c4 = st.columns([2, 1, 1, 1]) # 검색창 넓게
-            with c1:
-                if stock_list_for_ui:
-                    try:
-                        samsung_str = next((s for s in stock_list_for_ui if s.startswith("삼성전자")), stock_list_for_ui[0])
-                        default_index = stock_list_for_ui.index(samsung_str)
-                    except (ValueError, IndexError):
-                        default_index = 0
-                    
-                    selected_formatted_string = st.selectbox(
-                        "종목명 또는 종목코드 검색", 
-                        options=stock_list_for_ui, 
-                        index=default_index
-                    )
-                    ticker = ticker_map[selected_formatted_string]
-                else:
-                    ticker = st.text_input("종목 코드", value="005930", help="예: 005930 (삼성전자). 종목 리스트 로딩에 실패했습니다.")
-            with c2:
-                days = st.slider("메인 기간(일)", 7, 730, 90, step=1)
-            with c3:
-                beta = st.number_input("베타", value=1.0, min_value=0.1, max_value=3.0, step=0.1)
-            with c4:
-                years = st.selectbox("재무 연수", [3, 5, 7], index=1)
-
-            with st.expander("고급 설정", expanded=False):
-                use_dart = st.checkbox("DART 재무분석 사용", value=bool(DART_KEY), help="config.ini에 키가 있어야 활성화됩니다.")
-                use_aux_chart = st.checkbox("보조차트 활성화", help="오른쪽에 다른 기간의 보조차트를 함께 표시합니다.")
-                aux_days = st.slider("보조차트 기간(일)", 7, 365, 60, step=1, disabled=not use_aux_chart)
-
-            submitted = st.form_submit_button("📄 종합 보고서 생성")
-
-    # 제출 시 새 보고서 생성 → 세션에 저장
-    if submitted:
-        st.session_state.report_ready = False  # Reset
-        main_rpt = ReportBuilder(ticker=ticker, days=days, beta=beta, years=years, use_dart=use_dart)
-        if main_rpt.validate():
-            with st.spinner("메인 보고서 데이터 수집 중..."):
-                main_rpt.collect()
-                main_rpt.build_charts()
-            st.session_state.rpt = main_rpt
-            st.session_state.report_ready = True
-        else:
-            for e in main_rpt.errors:
-                st.error(f"메인 보고서 오류: {e}")
-
-        st.session_state.aux_rpt = None
-        if use_aux_chart and st.session_state.report_ready:
-            # 보조 리포트는 DART 분석을 제외하여 빠르게 생성
-            aux_rpt = ReportBuilder(ticker=ticker, days=aux_days, beta=beta, years=years, use_dart=False)
-            if aux_rpt.validate():
-                with st.spinner(f"{aux_days}일 보조 보고서 생성 중..."):
-                    aux_rpt.collect()
-                    aux_rpt.build_charts()
-                st.session_state.aux_rpt = aux_rpt
+        with c1:
+            if not stock_list_for_ui:
+                st.warning("종목 리스트를 불러올 수 없습니다.")
+                selected_stock = None
             else:
-                for e in aux_rpt.errors:
-                    st.error(f"보조 보고서 오류: {e}")
+                # 기본 선택값으로 '삼성전자' 설정
+                try:
+                    samsung_str = next(s for s in stock_list_for_ui if s.startswith("삼성전자"))
+                    default_index = stock_list_for_ui.index(samsung_str)
+                except (StopIteration, ValueError):
+                    default_index = 0
+                
+                selected_stock = st.selectbox(
+                    "종목 선택",
+                    options=stock_list_for_ui,
+                    index=default_index,
+                    help="목록에서 분석할 종목을 선택하세요. 드롭다운을 열고 종목명이나 코드를 입력하여 검색할 수 있습니다."
+                )
+        
+        with c2:
+            days = st.slider("메인 기간(일)", 7, 730, 90, step=1)
+        with c3:
+            beta = st.number_input("베타", value=1.0, min_value=0.1, max_value=3.0, step=0.1)
+        with c4:
+            years = st.selectbox("재무 연수", [3, 5, 7], index=1)
 
-    # --- 렌더링 ---
-    if st.session_state.report_ready and st.session_state.rpt:
+        with st.expander("고급 설정"):
+            use_dart = st.checkbox("DART 재무분석 사용", value=bool(DART_KEY), help="config.ini에 키가 있어야 활성화됩니다.")
+            use_aux_chart = st.checkbox("보조차트 활성화", help="오른쪽에 다른 기간의 보조차트를 함께 표시합니다.")
+            aux_days = st.slider("보조차트 기간(일)", 7, 365, 60, step=1, disabled=not use_aux_chart)
+
+        submitted = st.form_submit_button("📄 종합 보고서 생성")
+
+    # --- 보고서 생성 및 렌더링 ---
+    if submitted:
+        if selected_stock:
+            match = re.search(r'\((\d{6})\)', selected_stock)
+            ticker = match.group(1) if match else ""
+            
+            st.session_state.report_ready = False
+            main_rpt = ReportBuilder(ticker=ticker, days=days, beta=beta, years=years, use_dart=use_dart)
+            
+            if main_rpt.validate():
+                with st.spinner("메인 보고서 데이터 수집 중..."):
+                    main_rpt.collect()
+                    main_rpt.build_charts()
+                st.session_state.rpt = main_rpt
+                st.session_state.report_ready = True
+            else:
+                for e in main_rpt.errors:
+                    st.error(f"메인 보고서 오류: {e}")
+                st.session_state.rpt = None
+
+            if use_aux_chart and st.session_state.get("report_ready"):
+                aux_rpt = ReportBuilder(ticker=ticker, days=aux_days, beta=beta, years=years, use_dart=False)
+                if aux_rpt.validate():
+                    with st.spinner(f"{aux_days}일 보조 보고서 생성 중..."):
+                        aux_rpt.collect()
+                        aux_rpt.build_charts()
+                    st.session_state.aux_rpt = aux_rpt
+                else:
+                    for e in aux_rpt.errors:
+                        st.warning(f"보조 보고서 오류: {e}")
+            else:
+                st.session_state.aux_rpt = None
+        else:
+            st.error("종목을 선택해주세요.")
+            st.session_state.report_ready = False
+
+    if st.session_state.get("report_ready") and st.session_state.get("rpt"):
         main_rpt = st.session_state.rpt
         aux_rpt = st.session_state.get("aux_rpt")
 
-        # 1. 개요 및 밸류에이션은 메인 리포트 기준으로 한 번만 표시
         main_rpt.render_overview()
 
-        # 2. 차트는 좌우로 나란히 표시
         if aux_rpt:
             col1, col2 = st.columns(2)
             with col1:
@@ -1173,7 +1236,6 @@ def run():
         else:
             main_rpt.render_charts()
 
-        # 3. 나머지 상세 정보는 메인 리포트 기준으로 표시
         st.markdown("---")
         main_rpt.render_financials()
         st.markdown("---")
@@ -1181,25 +1243,18 @@ def run():
         st.markdown("---")
         main_rpt.render_logs()
 
-        # 내보내기 버튼은 메인 보고서 기준
         st.markdown("---")
         st.subheader("🖨️ 보고서 내보내기")
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if st.button("PDF/HTML 저장", key="export_btn", use_container_width=True):
-                out = main_rpt.export()
-                if out and out.exists():
-                    st.success(f"저장 완료: {out.name}")
-                    try:
-                        st.download_button("다운로드", data=open(out, "rb").read(), file_name=out.name, key=f"dl_{out.name}")
-                    except Exception:
-                        st.info("다운로드 제한 시, 보고서 폴더의 파일을 직접 확인하세요.")
-                else:
-                    st.error("내보내기에 실패했습니다.")
-        with col2:
-            st.caption("ReportLab + kaleido 설치 시 PDF, 미설치 시 HTML로 자동 저장됩니다. HTML은 브라우저 인쇄로 PDF 저장 가능.")
+        if st.button("PDF/HTML 저장"):
+            out = main_rpt.export()
+            if out and out.exists():
+                st.success(f"저장 완료: {out.name}")
+                with open(out, "rb") as f:
+                    st.download_button("다운로드", f, file_name=out.name)
+            else:
+                st.error("내보내기에 실패했습니다.")
     else:
-        st.info("상단의 설정을 입력하고 ‘종합 보고서 생성’을 눌러주세요.")
+        st.info("분석할 종목을 선택한 후 ‘종합 보고서 생성’ 버튼을 눌러주세요.")
 
 
 if __name__ == "__main__":

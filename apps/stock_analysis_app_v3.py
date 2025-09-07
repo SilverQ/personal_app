@@ -35,20 +35,25 @@ else:
 def get_stock_list():
     """apps/stock_list.csv 파일에서 전체 상장 종목 리스트를 가져오는 함수"""
     try:
-        df_listing = pd.read_csv('apps/stock_list.csv', dtype={'Code': str})
+        df_listing = pd.read_csv('apps/stock_list.csv', dtype={'code': str})
     except FileNotFoundError:
         st.error("'apps/stock_list.csv' 파일을 찾을 수 없습니다.")
         return pd.DataFrame()
     return df_listing
 
+@st.cache_data(ttl=86400) # 24시간 동안 캐시
+def get_fdr_stock_listing():
+    """FinanceDataReader를 사용하여 KRX 전체 상장 종목 리스트를 가져오는 함수 (시가총액 계산용)"""
+    # 이 함수는 캐시되어 앱 실행 중 한 번만 호출됩니다.
+    return fdr.StockListing('KRX')
+
 @st.cache_data(ttl=3600) # 1시간 동안 캐시하여 불필요한 API 호출 방지
 def get_stock_info(ticker, date_str):
-    """FinanceDataReader를 사용하여 특정 날짜의 주식 정보를 가져오는 함수"""
+    """FinanceDataReader를 사용하여 특정 날짜의 주식 정보와 시가총액을 가져오는 함수"""
     try:
-        # 최신 가격 정보 조회 (오늘 날짜 기준)
+        # 1. 최신 가격 정보 조회
         df_price = fdr.DataReader(ticker, date_str)
         if df_price.empty:
-            # 만약 오늘 데이터가 없다면(주말, 공휴일 등) 가장 최신 데이터 1개만 가져옴
             df_price = fdr.DataReader(ticker)
             if df_price.empty:
                 st.error(f"'{ticker}'에 대한 가격 정보를 조회할 수 없습니다.")
@@ -56,11 +61,13 @@ def get_stock_info(ticker, date_str):
         
         price = df_price.iloc[-1]['Close']
 
-        # 상장주식수 조회하여 시가총액 계산 (캐시된 데이터 활용)
-        df_listing = get_stock_list()
+        # 2. 상장 주식 수 조회하여 시가총액 계산
+        df_listing = get_fdr_stock_listing()
+        # FinanceDataReader의 'Code' 컬럼을 사용하여 ticker를 찾습니다.
         listing_info = df_listing[df_listing['Code'] == ticker]
         
         if not listing_info.empty:
+            # 'Stocks' 컬럼에서 상장 주식 수를 가져옵니다.
             listed_shares = listing_info['Stocks'].iloc[0]
             market_cap = listed_shares * price
         else:

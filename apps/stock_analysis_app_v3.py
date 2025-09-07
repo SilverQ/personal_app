@@ -4,6 +4,7 @@ from google import genai
 import os
 import FinanceDataReader as fdr
 import configparser
+import re
 
 # --- Gemini API Client Initialization ---
 # 1. 환경 변수에서 API 키를 먼저 시도합니다 (GEMINI_API_KEY 또는 GOOGLE_API_KEY).
@@ -13,8 +14,11 @@ api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 if not api_key:
     try:
         config = configparser.ConfigParser()
-        # streamlit 실행 위치(프로젝트 루트)를 기준으로 config.ini 경로를 설정합니다.
-        config.read('config.ini')
+        # 스크립트 파일의 위치를 기준으로 config.ini 경로를 절대 경로로 계산합니다.
+        APP_DIR = os.path.dirname(os.path.abspath(__file__))
+        ROOT_DIR = os.path.dirname(APP_DIR)
+        config_path = os.path.join(ROOT_DIR, 'config.ini')
+        config.read(config_path)
         api_key = config.get('GEMINI_API_KEY', 'key', fallback=None)
     except Exception:
         # config.ini 파일이 없거나 읽기 오류가 발생해도 앱 실행은 계속됩니다.
@@ -35,9 +39,19 @@ else:
 def get_stock_list():
     """apps/stock_list.csv 파일에서 전체 상장 종목 리스트를 가져오는 함수"""
     try:
-        df_listing = pd.read_csv('apps/stock_list.csv', dtype={'code': str})
+        # 스크립트 파일의 위치를 기준으로 stock_list.csv 경로를 절대 경로로 계산합니다.
+        APP_DIR = os.path.dirname(os.path.abspath(__file__))
+        stock_list_path = os.path.join(APP_DIR, 'stock_list.csv')
+        df_listing = pd.read_csv(stock_list_path, dtype={'code': str, 'name': str})
+        # 필요한 컬럼이 모두 있는지 확인
+        if 'name' not in df_listing.columns or 'code' not in df_listing.columns:
+            st.error("'apps/stock_list.csv' 파일에 'name' 또는 'code' 컬럼이 없습니다.")
+            return pd.DataFrame()
     except FileNotFoundError:
         st.error("'apps/stock_list.csv' 파일을 찾을 수 없습니다.")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"종목 리스트 로딩 중 오류 발생: {e}")
         return pd.DataFrame()
     return df_listing
 
@@ -84,11 +98,12 @@ def generate_gemini_content(prompt, system_instruction):
     if client is None:
         return "오류: Gemini 클라이언트가 초기화되지 않았습니다. API 키 설정을 확인하세요."
     try:
-        # 새로운 라이브러리 호출 방식 적용
+        # 구버전 라이브러리와의 호환성을 위해 시스템 프롬프트와 사용자 프롬프트를 결합합니다.
+        combined_prompt = f"{system_instruction}\n\n{prompt}"
+        
         response = client.models.generate_content(
             model='models/gemini-1.5-flash',
-            contents=prompt,
-            system_instruction=system_instruction
+            contents=combined_prompt
         )
         return response.text
     except Exception as e:
@@ -105,10 +120,23 @@ def main():
     # --- Initialize session state ---
     if 'gemini_analysis' not in st.session_state:
         st.session_state.gemini_analysis = "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요."
+    if 'main_business' not in st.session_state:
+        st.session_state.main_business = "-"
+    if 'investment_summary' not in st.session_state:
+        st.session_state.investment_summary = "-"
     if 'current_price' not in st.session_state:
         st.session_state.current_price = None
     if 'market_cap' not in st.session_state:
         st.session_state.market_cap = 0
+    if 'df_forecast' not in st.session_state:
+        # 실적 전망 테이블 초기화 (SK하이닉스 예시 데이터)
+        data = {
+            '(단위: 십억원)': ['매출액', '영업이익', '순이익', 'EPS (원)', 'BPS (원)', 'ROE (%)'],
+            '2023A': [32766, -7730, -9138, -7437, 119897, -6.0],
+            '2024E': [107461, 21843, 15635, 12724, 135321, 9.4],
+            '2025E': [129765, 28742, 20567, 16738, 152059, 11.0]
+        }
+        st.session_state.df_forecast = pd.DataFrame(data).set_index('(단위: 십억원)')
 
     # --- Title Area ---
     title_col, info_col = st.columns([3, 1])
@@ -131,9 +159,41 @@ def main():
 
         with input_col1:
             st.subheader("분석 대상 기업")
-            company_name = st.text_input("기업명", "SK하이닉스")
-            stock_code = st.text_input("종목코드", "000660")
             
+            df_listing = get_stock_list()
+            
+            # 'name'과 'code' 컬럼이 있는지, 데이터가 비어있지 않은지 확인
+            if not df_listing.empty:
+                # "기업명 (종목코드)" 형식의 리스트 생성
+                df_listing['display'] = df_listing['name'] + ' (' + df_listing['code'] + ')'
+                stock_options = df_listing['display'].tolist()
+                
+                # 기본 선택값 설정 (예: SK하이닉스)
+                default_selection = "SK하이닉스 (000660)"
+                try:
+                    default_index = stock_options.index(default_selection)
+                except ValueError:
+                    default_index = 0
+                
+                selected_stock = st.selectbox(
+                    "기업 선택",
+                    stock_options,
+                    index=default_index,
+                    help="분석할 기업을 선택하세요."
+                )
+
+                # 선택된 문자열에서 기업명과 종목코드 분리
+                match = re.match(r"(.+) \((.+)\)", selected_stock)
+                if match:
+                    company_name, stock_code = match.groups()
+                else:
+                    company_name, stock_code = "", "" # Fallback
+            else:
+                # df_listing이 비어있거나 필요한 컬럼이 없는 경우, 기존의 text_input 방식을 fallback으로 사용
+                st.warning("종목 리스트를 불러오지 못했습니다. 기업명과 종목코드를 직접 입력해주세요.")
+                company_name = st.text_input("기업명", "SK하이닉스")
+                stock_code = st.text_input("종목코드", "000660")
+
             if st.button("📈 최신 시세 조회", help="최신 종가와 시가총액 정보를 가져옵니다."):
                 with st.spinner("최신 시세 정보를 조회 중입니다..."):
                     price, market_cap = get_stock_info(stock_code, today_str)
@@ -146,18 +206,75 @@ def main():
 
             if st.button("✨ Gemini 최신 정보 분석", help="최신 뉴스와 데이터를 바탕으로 투자 포인트와 리스크 요인을 새로 분석합니다."):
                 with st.spinner('Gemini가 최신 정보를 분석 중입니다... 잠시만 기다려주세요.'):
-                    system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
-                    user_prompt = f"**기업 분석 요청**\n- **분석 대상:** {company_name}({stock_code})\n- **요청 사항:** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 도출해주세요.\n\n**[결과 출력 형식]**\n### 긍정적 투자 포인트\n**1. [제목]**\n- [근거1]\n- [근거2]\n**2. [제목]**\n- [근거1]\n- [근거2]\n\n### 잠재적 리스크 요인\n**1. [제목]**\n- [근거1]\n- [근거2]\n**2. [제목]**\n- [근거1]\n- [근거2]"
-                    st.session_state.gemini_analysis = generate_gemini_content(user_prompt, system_prompt)
+                    system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다. 요청받은 모든 항목에 대해 반드시 한국어로 답변해야 합니다."
+                    user_prompt = f'''**기업 분석 요청**
+- **분석 대상:** {company_name}({stock_code})
+- **요청 사항:**
+  1. 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
+  2. 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
+  3. 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
+
+**[결과 출력 형식]**
+### 주요 사업
+[여기에 주요 사업 내용 작성]
+
+### 핵심 투자 요약
+[여기에 핵심 투자 요약 내용 작성]
+
+### 긍정적 투자 포인트
+**1. [제목]**
+- [근거1]
+- [근거2]
+**2. [제목]**
+- [근거1]
+- [근거2]
+
+### 잠재적 리스크 요인
+**1. [제목]**
+- [근거1]
+- [근거2]
+**2. [제목]**
+- [근거1]
+- [근거2]'''
+                    
+                    full_response = generate_gemini_content(user_prompt, system_prompt)
+                    
+                    # 응답 파싱 로직
+                    try:
+                        # '###'를 기준으로 응답을 분리합니다.
+                        parts = full_response.split('###')
+                        
+                        # 각 섹션의 내용을 추출합니다. strip()으로 공백을 제거합니다.
+                        st.session_state.main_business = parts[1].replace('주요 사업', '').strip()
+                        st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
+                        
+                        # '긍정적 투자 포인트'와 '잠재적 리스크 요인' 부분을 합쳐서 저장합니다.
+                        st.session_state.gemini_analysis = "###" + "###".join(parts[3:])
+
+                    except Exception as e:
+                        # 파싱 실패 시, 전체 응답을 보여주고 오류 메시지를 기록합니다.
+                        st.session_state.main_business = "-"
+                        st.session_state.investment_summary = "-"
+                        st.session_state.gemini_analysis = f"**오류: Gemini 응답을 처리하는 중 문제가 발생했습니다.**\n\n{full_response}"
 
         with input_col2:
             st.subheader("PBR-ROE 모델 변수")
-            est_roe = st.slider("예상 ROE (%)", 0.0, 50.0, 24.71, 0.1)
+            
+            # 실적 전망 테이블의 2025년 추정치를 기본값으로 사용
+            try:
+                default_roe = float(st.session_state.df_forecast.loc['ROE (%)', '2025E'])
+                default_bps = int(st.session_state.df_forecast.loc['BPS (원)', '2025E'])
+            except (ValueError, KeyError):
+                # 테이블 로드 실패 시 사용할 안전한 기본값
+                default_roe = 10.0
+                default_bps = 150000
+
+            est_roe = st.slider("예상 ROE (%)", 0.0, 50.0, default_roe, 0.1, help="실적 전망 테이블의 2025년 ROE(%)가 기본값으로 설정됩니다.")
             cost_of_equity = st.slider("자기자본비용 (Ke, %)", 5.0, 15.0, 9.0, 0.1)
             terminal_growth = st.slider("영구성장률 (g, %)", 0.0, 5.0, 3.0, 0.1)
             
             st.subheader("목표주가 산출 변수")
-            est_bps = st.number_input("예상 BPS (원)", value=125000)
+            est_bps = st.number_input("예상 BPS (원)", value=default_bps, help="실적 전망 테이블의 2025년 BPS(원)가 기본값으로 설정됩니다.")
 
     # --- Calculation ---
     target_pbr = (est_roe - terminal_growth) / (cost_of_equity - terminal_growth) if (cost_of_equity - terminal_growth) != 0 else 0
@@ -169,16 +286,30 @@ def main():
     st.header("1. 요약 (Executive Summary)")
     
     upside_potential = 0.0
-    if st.session_state.current_price and calculated_target_price > 0:
+    # 현재가가 유효한 경우에만 상승여력 계산
+    if st.session_state.current_price and st.session_state.current_price > 0 and calculated_target_price > 0:
         upside_potential = ((calculated_target_price / st.session_state.current_price) - 1) * 100
+    
+    # 투자의견 결정 로직
+    if upside_potential > 15:
+        investment_opinion = "매수 (Buy)"
+    elif upside_potential > -5:
+        investment_opinion = "중립 (Neutral)"
+    else:
+        investment_opinion = "매도 (Sell)"
+    
+    # 현재가가 없으면 투자의견 보류
+    if not st.session_state.current_price or st.session_state.current_price == 0:
+        investment_opinion = "-"
+        upside_potential = 0.0
 
     summary_cols = st.columns(4)
-    summary_cols[0].metric("투자의견", "-")
-    summary_cols[1].metric("현재주가", f"{st.session_state.current_price:,.0f} 원" if st.session_state.current_price is not None else "0 원")
+    summary_cols[0].metric("투자의견", investment_opinion)
+    summary_cols[1].metric("현재주가", f"{st.session_state.current_price:,.0f} 원" if st.session_state.current_price else "N/A")
     summary_cols[2].metric("목표주가", f"{calculated_target_price:,.0f} 원")
     summary_cols[3].metric("상승여력", f"{upside_potential:.2f} %")
 
-    st.info(f"**핵심 투자 요약:**\n\n> -")
+    st.info(f"**핵심 투자 요약:**\n\n> {st.session_state.investment_summary}")
     st.divider()
 
     # --- Main Content in 2 Columns ---
@@ -201,15 +332,13 @@ def main():
 
     # --- 4. 실적 전망 (Earnings Forecast) ---
     st.header("4. 실적 전망 (Earnings Forecast)")
-    data = {
-        '(단위: 십억원)': ['매출액', '영업이익', '순이익', 'EPS (원)', 'BPS (원)', 'ROE (%)'],
-        '2023A': [0, 0, 0, 0, 0, 0.0],
-        '2024E': [0, 0, 0, 0, 0, 0.0],
-        '2025E': [0, 0, 0, 0, 0, 0.0]
-    }
-    df_forecast = pd.DataFrame(data).set_index('(단위: 십억원)')
-    st.dataframe(df_forecast, use_container_width=True)
-    st.caption("> 2024년, 2025년 실적은 시장 컨센서스를 바탕으로 한 추정치입니다.")
+    st.caption("아래 표의 데이터를 직접 수정하여 목표주가 계산에 실시간으로 반영할 수 있습니다.")
+    
+    # st.data_editor를 사용하여 사용자가 데이터를 직접 수정할 수 있도록 함
+    edited_df = st.data_editor(st.session_state.df_forecast, use_container_width=True)
+    st.session_state.df_forecast = edited_df # 수정된 내용을 다시 세션 상태에 저장
+    
+    st.caption("> 2024년, 2025년 실적은 시장 컨센서스 또는 사용자 추정치를 바탕으로 합니다.")
     st.divider()
 
     # --- 5. 가치평가 (Valuation) ---

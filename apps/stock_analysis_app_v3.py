@@ -1,14 +1,45 @@
 import streamlit as st
 import pandas as pd
-import google.generativeai as genai
+from google import genai
 import os
 import FinanceDataReader as fdr
+import configparser
 
-# --- Gemini API Configuration ---
-# 실제 배포 시에는 st.secrets 또는 환경변수 사용을 권장합니다.
-# GEMINI_API_key = os.environ.get("GEMINI_API_KEY")
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY" # 여기에 실제 API 키를 입력하세요.
-genai.configure(api_key=GEMINI_API_KEY)
+# --- Gemini API Client Initialization ---
+# 1. 환경 변수에서 API 키를 먼저 시도합니다 (GEMINI_API_KEY 또는 GOOGLE_API_KEY).
+api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+# 2. 환경 변수에 키가 없으면 config.ini 파일에서 읽기를 시도합니다.
+if not api_key:
+    try:
+        config = configparser.ConfigParser()
+        # streamlit 실행 위치(프로젝트 루트)를 기준으로 config.ini 경로를 설정합니다.
+        config.read('config.ini')
+        api_key = config.get('GEMINI_API_KEY', 'key', fallback=None)
+    except Exception:
+        # config.ini 파일이 없거나 읽기 오류가 발생해도 앱 실행은 계속됩니다.
+        pass
+
+# 3. 최종적으로 얻은 키로 클라이언트를 초기화합니다.
+client = None
+if api_key:
+    try:
+        client = genai.Client(api_key=api_key)
+    except Exception as e:
+        st.error(f"Gemini API 클라이언트 초기화 중 오류가 발생했습니다: {e}")
+else:
+    # 키를 찾지 못했을 경우, 앱 실행 시 경고 메시지를 한 번만 표시합니다.
+    st.warning("Gemini API 키를 찾을 수 없어 AI 분석 기능이 제한됩니다. 환경 변수 또는 config.ini 파일을 확인해주세요.")
+
+@st.cache_data(ttl=86400) # 24시간 동안 캐시
+def get_stock_list():
+    """apps/stock_list.csv 파일에서 전체 상장 종목 리스트를 가져오는 함수"""
+    try:
+        df_listing = pd.read_csv('apps/stock_list.csv', dtype={'Code': str})
+    except FileNotFoundError:
+        st.error("'apps/stock_list.csv' 파일을 찾을 수 없습니다.")
+        return pd.DataFrame()
+    return df_listing
 
 @st.cache_data(ttl=3600) # 1시간 동안 캐시하여 불필요한 API 호출 방지
 def get_stock_info(ticker, date_str):
@@ -25,8 +56,8 @@ def get_stock_info(ticker, date_str):
         
         price = df_price.iloc[-1]['Close']
 
-        # 상장주식수 조회하여 시가총액 계산
-        df_listing = fdr.StockListing('KRX')
+        # 상장주식수 조회하여 시가총액 계산 (캐시된 데이터 활용)
+        df_listing = get_stock_list()
         listing_info = df_listing[df_listing['Code'] == ticker]
         
         if not listing_info.empty:
@@ -43,12 +74,15 @@ def get_stock_info(ticker, date_str):
 
 def generate_gemini_content(prompt, system_instruction):
     """Gemini API를 호출하여 콘텐츠를 생성하는 함수 (시스템 프롬프트 적용)"""
+    if client is None:
+        return "오류: Gemini 클라이언트가 초기화되지 않았습니다. API 키 설정을 확인하세요."
     try:
-        model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+        # 새로운 라이브러리 호출 방식 적용
+        response = client.models.generate_content(
+            model='models/gemini-1.5-flash',
+            contents=prompt,
             system_instruction=system_instruction
         )
-        response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         # 오류 내용을 Streamlit 화면에 직접 자세히 표시합니다.
@@ -63,11 +97,11 @@ def main():
 
     # --- Initialize session state ---
     if 'gemini_analysis' not in st.session_state:
-        st.session_state.gemini_analysis = "사이드바의 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요."
+        st.session_state.gemini_analysis = "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요."
     if 'current_price' not in st.session_state:
-        st.session_state.current_price = 230000
+        st.session_state.current_price = None
     if 'market_cap' not in st.session_state:
-        st.session_state.market_cap = "정보 조회 필요"
+        st.session_state.market_cap = 0
 
     # --- Title Area ---
     title_col, info_col = st.columns([3, 1])
@@ -84,45 +118,60 @@ def main():
 
     st.divider()
 
-    # --- Sidebar Inputs ---
-    st.sidebar.header("분석 대상 기업")
-    company_name = st.sidebar.text_input("기업명", "SK하이닉스")
-    stock_code = st.sidebar.text_input("종목코드", "000660")
+    # --- Inputs Expander ---
+    with st.expander("⚙️ 분석 설정 (기업, 모델 변수 등)", expanded=True):
+        input_col1, input_col2 = st.columns(2)
 
-    if st.sidebar.button("📈 최신 시세 조회", help="네이버 금융에서 최신 종가와 시가총액 정보를 가져옵니다."):
-        with st.spinner("최신 시세 정보를 조회 중입니다..."):
-            price, market_cap = get_stock_info(stock_code, today_str)
-            if price is not None:
-                st.session_state.current_price = price
-                if market_cap is not None:
-                    st.session_state.market_cap = f"{market_cap / 1000000000000:,.1f}조 원"
-                st.sidebar.success("시세 조회가 완료되었습니다.")
-            else:
-                st.sidebar.error("정보 조회에 실패했습니다.")
+        with input_col1:
+            st.subheader("분석 대상 기업")
+            company_name = st.text_input("기업명", "SK하이닉스")
+            stock_code = st.text_input("종목코드", "000660")
+            
+            if st.button("📈 최신 시세 조회", help="최신 종가와 시가총액 정보를 가져옵니다."):
+                with st.spinner("최신 시세 정보를 조회 중입니다..."):
+                    price, market_cap = get_stock_info(stock_code, today_str)
+                    st.session_state.current_price = price if price is not None else None
+                    st.session_state.market_cap = market_cap if market_cap is not None else 0
+                    if price is not None:
+                        st.success("시세 조회가 완료되었습니다.")
+                    else:
+                        st.error("정보 조회에 실패했습니다.")
 
-    st.sidebar.divider()
-    
-    if st.sidebar.button("✨ Gemini 최신 정보 분석", help="최신 뉴스와 데이터를 바탕으로 투자 포인트와 리스크 요인을 새로 분석합니다."):
-        with st.spinner('Gemini가 최신 정보를 분석 중입니다... 잠시만 기다려주세요.'):
-            system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
-            user_prompt = f"**기업 분석 요청**\n- **분석 대상:** {company_name}({stock_code})\n- **요청 사항:** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 도출해주세요.\n\n**[결과 출력 형식]**\n### 긍정적 투자 포인트\n**1. [제목]**\n- [근거1]\n- [근거2]\n**2. [제목]**\n- [근거1]\n- [근거2]\n\n### 잠재적 리스크 요인\n**1. [제목]**\n- [근거1]\n- [근거2]\n**2. [제목]**\n- [근거1]\n- [근거2]"
-            st.session_state.gemini_analysis = generate_gemini_content(user_prompt, system_prompt)
+            if st.button("✨ Gemini 최신 정보 분석", help="최신 뉴스와 데이터를 바탕으로 투자 포인트와 리스크 요인을 새로 분석합니다."):
+                with st.spinner('Gemini가 최신 정보를 분석 중입니다... 잠시만 기다려주세요.'):
+                    system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
+                    user_prompt = f"**기업 분석 요청**\n- **분석 대상:** {company_name}({stock_code})\n- **요청 사항:** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 도출해주세요.\n\n**[결과 출력 형식]**\n### 긍정적 투자 포인트\n**1. [제목]**\n- [근거1]\n- [근거2]\n**2. [제목]**\n- [근거1]\n- [근거2]\n\n### 잠재적 리스크 요인\n**1. [제목]**\n- [근거1]\n- [근거2]\n**2. [제목]**\n- [근거1]\n- [근거2]"
+                    st.session_state.gemini_analysis = generate_gemini_content(user_prompt, system_prompt)
 
-    st.sidebar.divider()
+        with input_col2:
+            st.subheader("PBR-ROE 모델 변수")
+            est_roe = st.slider("예상 ROE (%)", 0.0, 50.0, 24.71, 0.1)
+            cost_of_equity = st.slider("자기자본비용 (Ke, %)", 5.0, 15.0, 9.0, 0.1)
+            terminal_growth = st.slider("영구성장률 (g, %)", 0.0, 5.0, 3.0, 0.1)
+            
+            st.subheader("목표주가 산출 변수")
+            est_bps = st.number_input("예상 BPS (원)", value=125000)
+
+    # --- Calculation ---
+    target_pbr = (est_roe - terminal_growth) / (cost_of_equity - terminal_growth) if (cost_of_equity - terminal_growth) != 0 else 0
+    calculated_target_price = target_pbr * est_bps
+
+    st.divider()
 
     # --- 1. 요약 (Executive Summary) ---
     st.header("1. 요약 (Executive Summary)")
     
-    target_price = 283000  # Placeholder
-    upside_potential = ((target_price / st.session_state.current_price) - 1) * 100 if st.session_state.current_price > 0 else 0
+    upside_potential = 0.0
+    if st.session_state.current_price and calculated_target_price > 0:
+        upside_potential = ((calculated_target_price / st.session_state.current_price) - 1) * 100
 
     summary_cols = st.columns(4)
-    summary_cols[0].metric("투자의견", "BUY")
-    summary_cols[1].metric("현재주가", f"{st.session_state.current_price:,.0f} 원")
-    summary_cols[2].metric("목표주가", f"{target_price:,.0f} 원")
+    summary_cols[0].metric("투자의견", "-")
+    summary_cols[1].metric("현재주가", f"{st.session_state.current_price:,.0f} 원" if st.session_state.current_price is not None else "0 원")
+    summary_cols[2].metric("목표주가", f"{calculated_target_price:,.0f} 원")
     summary_cols[3].metric("상승여력", f"{upside_potential:.2f} %")
 
-    st.info(f"**핵심 투자 요약:**\n\n> **{company_name}**는 AI 시장 성장에 따른 HBM 수요 증가의 핵심 수혜주이며, 메모리 업황 개선에 따른 실적 턴어라운드가 기대됩니다.")
+    st.info(f"**핵심 투자 요약:**\n\n> -")
     st.divider()
 
     # --- Main Content in 2 Columns ---
@@ -132,8 +181,9 @@ def main():
         st.subheader("2. 기업 개요")
         st.text_input("회사명", company_name, disabled=True, key="company_name_display")
         st.text_input("티커", stock_code, disabled=True, key="stock_code_display")
-        st.text_area("주요 사업", "메모리 반도체(DRAM, NAND Flash) 및 시스템 반도체(CIS 등) 제조 및 판매", disabled=True)
-        st.text_input("시가총액", st.session_state.market_cap, disabled=True)
+        st.text_area("주요 사업", "-", disabled=True)
+        market_cap_display = f"{st.session_state.market_cap / 1000000000000:,.1f}조 원" if st.session_state.market_cap > 0 else "0 원"
+        st.text_input("시가총액", market_cap_display, disabled=True)
 
     with main_col2:
         st.subheader("3. Gemini 종합 분석")
@@ -146,9 +196,9 @@ def main():
     st.header("4. 실적 전망 (Earnings Forecast)")
     data = {
         '(단위: 십억원)': ['매출액', '영업이익', '순이익', 'EPS (원)', 'BPS (원)', 'ROE (%)'],
-        '2023A': [36229, -7730, -9138, -12544, 83836, -14.96],
-        '2024E': [62345, 15678, 12456, 17100, 101000, 16.93],
-        '2025E': [85789, 28910, 22500, 30890, 125000, 24.71]
+        '2023A': [0, 0, 0, 0, 0, 0.0],
+        '2024E': [0, 0, 0, 0, 0, 0.0],
+        '2025E': [0, 0, 0, 0, 0, 0.0]
     }
     df_forecast = pd.DataFrame(data).set_index('(단위: 십억원)')
     st.dataframe(df_forecast, use_container_width=True)
@@ -158,16 +208,6 @@ def main():
     # --- 5. 가치평가 (Valuation) ---
     st.header("5. 가치평가 (Valuation)")
     st.write("본 리포트는 **PBR-ROE 모델**을 기반으로 목표주가를 산출했습니다.")
-
-    st.sidebar.subheader("PBR-ROE 모델 변수")
-    est_roe = st.sidebar.slider("예상 ROE (%)", 0.0, 50.0, 24.71, 0.1)
-    cost_of_equity = st.sidebar.slider("자기자본비용 (Ke, %)", 5.0, 15.0, 9.0, 0.1)
-    terminal_growth = st.sidebar.slider("영구성장률 (g, %)", 0.0, 5.0, 3.0, 0.1)
-    st.sidebar.subheader("목표주가 산출 변수")
-    est_bps = st.sidebar.number_input("예상 BPS (원)", value=125000)
-
-    target_pbr = (est_roe - terminal_growth) / (cost_of_equity - terminal_growth) if (cost_of_equity - terminal_growth) != 0 else 0
-    calculated_target_price = target_pbr * est_bps
 
     st.subheader("5.1. 목표 PBR 산출")
     val_col1, val_col2 = st.columns(2)

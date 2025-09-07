@@ -1,7 +1,7 @@
 import streamlit as st
 
 # import mahalanobis_distance_app
-from apps import (currency_app, dummy_app, stock_analysis_app, stock_analysis_app_v2,
+from apps import (currency_app, dummy_app, stock_analysis_app_v2, stock_analysis_app_v3,
                   mahalanobis_distance_app)  # 각 앱을 모듈로 분리
 # from apps import chat
 
@@ -19,15 +19,17 @@ st.set_page_config(
 # 사이드바에서 앱 선택
 st.sidebar.title("애플리케이션 선택")
 app_choice = st.sidebar.radio("애플리케이션을 선택하세요:",
-                              ["환율 추이", "주식 분석", "Find Outlier"
+                              ["AI기반 주식 분석(개발중)", "주식 분석_v2", "환율 추이", "Find Outlier"
                                   # , "Ollama"
                                   , "더미 앱"])
 
 # 선택한 앱에 따라 다른 기능을 보여줌
-if app_choice == "환율 추이":
-    currency_app.run()  # 환율 추이 앱을 실행
-elif app_choice == "주식 분석":
+if app_choice == "AI기반 주식 분석(개발중)":
+    stock_analysis_app_v3.main()
+elif app_choice == "주식 분석_v2":
     stock_analysis_app_v2.run()  # 대화 앱을 실행
+elif app_choice == "환율 추이":
+    currency_app.run()  # 환율 추이 앱을 실행
 elif app_choice == "Find Outlier":
     mahalanobis_distance_app.run()  # 대화 앱을 실행
 # elif app_choice == "Ollama":

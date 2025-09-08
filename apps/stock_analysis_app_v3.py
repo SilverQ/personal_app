@@ -89,7 +89,6 @@ def get_kiwoom_token():
         response.raise_for_status()
         token_data = response.json()
 
-        # 키움 API는 'token' 이라는 키로 토큰을 반환합니다.
         if 'token' not in token_data:
             st.error("키움 API 토큰 발급 실패: 응답에 'token'이 없습니다.")
             st.json(token_data)
@@ -97,16 +96,14 @@ def get_kiwoom_token():
 
         st.session_state.kiwoom_token = token_data['token']
         
-        # 만료 시간 처리 (expires_dt 또는 expires_in 사용)
         if 'expires_dt' in token_data:
             try:
                 expires_ts = pd.to_datetime(token_data['expires_dt'], format='%Y%m%d%H%M%S').timestamp()
-                st.session_state.kiwoom_token_expires_at = expires_ts - 60 # 1분 버퍼
+                st.session_state.kiwoom_token_expires_at = expires_ts - 60
             except ValueError:
-                # 파싱 실패 시 기본값으로 1시간 설정
                 st.session_state.kiwoom_token_expires_at = time.time() + 3600 - 60
         else:
-            expires_in = int(token_data.get('expires_in', 3600)) # 기본 1시간
+            expires_in = int(token_data.get('expires_in', 3600))
             st.session_state.kiwoom_token_expires_at = time.time() + expires_in - 60
             
         return st.session_state.kiwoom_token
@@ -131,7 +128,7 @@ def get_kiwoom_stock_info(stock_code):
         "authorization": f"Bearer {token}",
         "appkey": KIWOOM_APP_KEY,
         "appsecret": KIWOOM_APP_SECRET,
-        "api-id": "ka10001" # 주식기본정보조회
+        "api-id": "ka10001"
     }
     params = {"stk_cd": stock_code}
 
@@ -140,13 +137,11 @@ def get_kiwoom_stock_info(stock_code):
         response.raise_for_status()
         data = response.json()
 
-        # 키움 API는 return_code가 0이면 성공입니다.
         if data.get('return_code') != 0:
             st.error(f"키움 API 오류: {data.get('return_msg', '상세 메시지 없음')}")
             st.json(data)
             return {}
 
-        # +, - 기호를 제거하고 숫자 타입으로 변환하는 헬퍼 함수
         def clean_value(value_str):
             if isinstance(value_str, str) and value_str:
                 try:
@@ -157,10 +152,9 @@ def get_kiwoom_stock_info(stock_code):
                 return float(value_str)
             return 0.0
 
-        # 성공 응답에서 직접 데이터를 파싱합니다.
         info = {
             'price': clean_value(data.get('cur_prc', 0)),
-            'market_cap': int(clean_value(data.get('mac', 0)) * 100000000), # 'mac'은 억원 단위
+            'market_cap': int(clean_value(data.get('mac', 0)) * 100000000),
             'per': clean_value(data.get('per', 0)),
             'pbr': clean_value(data.get('pbr', 0)),
             'eps': clean_value(data.get('eps', 0)),
@@ -213,7 +207,6 @@ def main():
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
 
     # --- Robust Session State Initialization ---
-    # 각 세션 상태 변수가 존재하는지 확인하고, 없으면 초기화합니다.
     if "gemini_analysis" not in st.session_state:
         st.session_state.gemini_analysis = "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요."
     if "main_business" not in st.session_state:
@@ -228,6 +221,8 @@ def main():
         st.session_state.kiwoom_token = None
     if "kiwoom_token_expires_at" not in st.session_state:
         st.session_state.kiwoom_token_expires_at = 0
+    if "gemini_api_calls" not in st.session_state:
+        st.session_state.gemini_api_calls = 0
 
     title_col, info_col = st.columns([3, 1])
     with title_col:
@@ -273,33 +268,10 @@ def main():
                         st.error("정보 조회에 실패했습니다.")
 
             if btn_cols[1].button("✨ AI 분석", help="최신 뉴스와 데이터를 바탕으로 투자 포인트와 리스크 요인을 새로 분석합니다.", use_container_width=True):
+                st.session_state.gemini_api_calls += 1
                 with st.spinner('Gemini가 최신 정보를 분석 중입니다...'):
                     system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
-                    user_prompt = f'''**기업 분석 요청**
-- **분석 대상:** {company_name}({stock_code})
-- **요청 사항:**
-  1. 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
-  2. 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
-  3. 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
-
-**[결과 출력 형식]**
-### 주요 사업
-[내용]
-
-### 핵심 투자 요약
-[내용]
-
-### 긍정적 투자 포인트
-**1. [제목]**
-- [근거]
-**2. [제목]**
-- [근거]
-
-### 잠재적 리스크 요인
-**1. [제목]**
-- [근거]
-**2. [제목]**
-- [근거]'''
+                    user_prompt = f'''**기업 분석 요청**\n- **분석 대상:** {company_name}({stock_code})\n- **요청 사항:**\n  1. 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.\n  2. 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.\n  3. 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.\n\n**[결과 출력 형식]**\n### 주요 사업\n[내용]\n\n### 핵심 투자 요약\n[내용]\n\n### 긍정적 투자 포인트\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]\n\n### 잠재적 리스크 요인\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]'''
                     full_response = generate_gemini_content(user_prompt, system_prompt)
                     try:
                         parts = full_response.split('###')
@@ -310,6 +282,9 @@ def main():
                         st.session_state.main_business = "-"
                         st.session_state.investment_summary = "-"
                         st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{full_response}"
+            
+            st.caption(f"AI 분석 호출 (이번 세션): {st.session_state.gemini_api_calls} / 25 (일일 한도)")
+            st.caption("_분당 5회 초과 시 오류가 발생할 수 있습니다._")
 
         with col2:
             st.markdown("**가치평가 모델**")

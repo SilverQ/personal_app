@@ -7,6 +7,8 @@ import re
 import requests
 import json
 import time
+import matplotlib.pyplot as plt
+import numpy as np
 
 # --- API Client Initialization ---
 # 스크립트 파일의 위치를 기준으로 config.ini 경로를 절대 경로로 계산합니다.
@@ -202,6 +204,105 @@ def reset_states_on_stock_change():
     st.session_state.kiwoom_data = {}
     st.session_state.df_forecast = get_empty_forecast_df()
 
+def display_stock_chart(stock_code):
+    """키움 API를 사용하여 주가, 투자자별 매매동향, 외국인 보유율 종합 차트를 생성하고 Streamlit에 표시하는 함수"""
+    token = get_kiwoom_token()
+    if not token:
+        st.error("차트를 생성하려면 키움 토큰이 필요합니다.")
+        return
+
+    with st.spinner("종합 차트 데이터를 조회하고 생성 중입니다..."):
+        try:
+            # 1. 단일 API 호출로 모든 데이터 조회
+            endpoint = '/api/dostk/mrkcond'
+            url = f'{KIWOOM_BASE_URL}{endpoint}'
+            headers = {
+                'Content-Type': 'application/json;charset=UTF-8',
+                'authorization': f'Bearer {token}',
+                'appkey': KIWOOM_APP_KEY,
+                'appsecret': KIWOOM_APP_SECRET,
+                'api-id': 'ka10086',
+            }
+            params = {
+                'stk_cd': stock_code,
+                'qry_dt': pd.Timestamp.now().strftime('%Y%m%d'),
+                'indc_tp': '1' # 금액(백만원)으로 조회
+            }
+            
+            response = requests.post(url, headers=headers, json=params)
+            response.raise_for_status()
+            
+            response_data = response.json()
+            if response_data.get('return_code') != 0:
+                st.error(f"API 조회 실패: {response_data.get('return_msg')}")
+                st.json(response_data)
+                return
+
+            daily_data = response_data.get('daly_stkpc', [])
+            if not daily_data:
+                st.warning("차트 데이터를 가져올 수 없습니다.")
+                return
+
+            # 2. 데이터프레임 생성 및 데이터 정제
+            df = pd.DataFrame(daily_data)
+            df['dt'] = pd.to_datetime(df['date'])
+            df = df.set_index('dt').sort_index() # 날짜 오름차순으로 정렬
+
+            # 데이터 클리닝 함수
+            def clean_numeric_str(series):
+                # 쉼표, + 기호 제거 및 -- 를 - 로 변경
+                cleaned_series = series.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
+                return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
+
+            df['close_pric'] = clean_numeric_str(df['close_pric'])
+            df['for_rt'] = clean_numeric_str(df['for_rt'])
+            df['for_netprps'] = clean_numeric_str(df['for_netprps'])
+            df['orgn_netprps'] = clean_numeric_str(df['orgn_netprps'])
+            df['ind_netprps'] = clean_numeric_str(df['ind_netprps'])
+
+            # 3. 3단 종합 차트 그리기
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 15), sharex=True, gridspec_kw={'height_ratios': [2, 1, 1]})
+            fig.suptitle(f'{stock_code} 종합 분석 차트', fontsize=20)
+
+            # 상단: 주가 차트
+            ax1.plot(df.index, df['close_pric'], label='Closing Price', color='dodgerblue')
+            if len(df) >= 5:
+                moving_average = df['close_pric'].rolling(window=5).mean()
+                ax1.plot(moving_average.index, moving_average, label='5-Day MA', color='orange', linestyle='--')
+            ax1.set_title('주가 추이 (Price Trend)', fontsize=14)
+            ax1.set_ylabel('Price')
+            ax1.legend()
+            ax1.grid(True, linestyle='--', alpha=0.6)
+
+            # 중단: 투자자별 순매수
+            ax2.bar(df.index, df['for_netprps'], label='Foreign', color='red', alpha=0.7)
+            ax2.bar(df.index, df['orgn_netprps'], label='Institution', color='blue', alpha=0.7)
+            ax2.bar(df.index, df['ind_netprps'], label='Individual', color='green', alpha=0.7)
+            ax2.axhline(0, color='gray', linestyle='--', linewidth=1)
+            ax2.set_title('투자자별 순매수 동향 (Net Buy Trend by Investor)', fontsize=14)
+            ax2.set_ylabel('Net Buy Amount (KRW 1M)')
+            ax2.legend()
+            ax2.grid(True, linestyle='--', alpha=0.6)
+
+            # 하단: 외국인 보유율
+            ax3.plot(df.index, df['for_rt'], label='Foreign Ownership', color='forestgreen')
+            ax3.set_title('외국인 지분율 추이 (Foreign Ownership Trend)', fontsize=14)
+            ax3.set_ylabel('Ownership (%)')
+            ax3.legend()
+            ax3.grid(True, linestyle='--', alpha=0.6)
+            
+            if len(df.index) > 30:
+                from matplotlib.ticker import MaxNLocator
+                ax3.xaxis.set_major_locator(MaxNLocator(10))
+            
+            fig.autofmt_xdate()
+            plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # suptitle과 겹치지 않게 조정
+            st.pyplot(fig)
+
+        except Exception as e:
+            st.error(f"차트 생성 중 오류 발생: {e}")
+            st.exception(e)
+
 def main():
     st.set_page_config(layout="wide")
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
@@ -271,7 +372,31 @@ def main():
                 st.session_state.gemini_api_calls += 1
                 with st.spinner('Gemini가 최신 정보를 분석 중입니다...'):
                     system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
-                    user_prompt = f'''**기업 분석 요청**\n- **분석 대상:** {company_name}({stock_code})\n- **요청 사항:**\n  1. 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.\n  2. 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.\n  3. 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.\n\n**[결과 출력 형식]**\n### 주요 사업\n[내용]\n\n### 핵심 투자 요약\n[내용]\n\n### 긍정적 투자 포인트\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]\n\n### 잠재적 리스크 요인\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]'''
+                    user_prompt = f'''**기업 분석 요청**
+- **분석 대상:** {company_name}({stock_code})
+- **요청 사항:**
+  1. 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
+  2. 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
+  3. 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
+
+**[결과 출력 형식]**
+### 주요 사업
+[내용]
+
+### 핵심 투자 요약
+[내용]
+
+### 긍정적 투자 포인트
+**1. [제목]**
+- [근거]
+**2. [제목]**
+- [근거]
+
+### 잠재적 리스크 요인
+**1. [제목]**
+- [근거]
+**2. [제목]**
+- [근거]'''
                     full_response = generate_gemini_content(user_prompt, system_prompt)
                     try:
                         parts = full_response.split('###')
@@ -372,6 +497,12 @@ def main():
     with val2_col2:
         st.success(f"**목표주가 (원):** `{calculated_target_price:,.0f}` 원")
     st.divider()    
+
+    st.header("6. 주가 차트 (Stock Chart)")
+    if st.button("📊 일봉 차트 생성", help="키움 API를 통해 최신 일봉 차트와 투자자별 매매 동향을 조회합니다.", use_container_width=True):
+        display_stock_chart(stock_code)
+
+    st.divider()
     st.write("*본 보고서는 외부 출처로부터 얻은 정보에 기반하며, 정확성을 보장하지 않습니다. 투자 결정에 대한 최종 책임은 투자자 본인에게 있습니다.*")
 
 if __name__ == "__main__":

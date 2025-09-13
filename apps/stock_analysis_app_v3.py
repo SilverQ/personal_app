@@ -204,6 +204,36 @@ def reset_states_on_stock_change():
     st.session_state.kiwoom_data = {}
     st.session_state.df_forecast = get_empty_forecast_df()
 
+def plot_price_chart(ax, df, title):
+    """주가 차트를 그리는 헬퍼 함수"""
+    ax.plot(df.index, df['close_pric'], label='Price', color='dodgerblue')
+    if len(df) >= 5:
+        ma = df['close_pric'].rolling(window=5).mean()
+        ax.plot(ma.index, ma, label='5-Period MA', color='orange', linestyle='--')
+    ax.set_title(title, fontsize=12)
+    ax.set_ylabel('Price')
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+def plot_net_buy_chart(ax, df, title):
+    """투자자별 순매수 차트를 그리는 헬퍼 함수"""
+    ax.bar(df.index, df['for_netprps'], label='Foreign', color='red', alpha=0.7)
+    ax.bar(df.index, df['orgn_netprps'], label='Institution', color='blue', alpha=0.7)
+    ax.bar(df.index, df['ind_netprps'], label='Individual', color='green', alpha=0.7)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=1)
+    ax.set_title(title, fontsize=12)
+    ax.set_ylabel('Amount (KRW 1M)')
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+def plot_ownership_chart(ax, df, title):
+    """외국인 지분율 차트를 그리는 헬퍼 함수"""
+    ax.plot(df.index, df['for_rt'], label='Ownership', color='forestgreen')
+    ax.set_title(title, fontsize=12)
+    ax.set_ylabel('Ownership (%)')
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+
 def display_stock_chart(stock_code):
     """키움 API를 사용하여 주가, 투자자별 매매동향, 외국인 보유율 종합 차트를 생성하고 Streamlit에 표시하는 함수"""
     token = get_kiwoom_token()
@@ -246,11 +276,9 @@ def display_stock_chart(stock_code):
             # 2. 데이터프레임 생성 및 데이터 정제
             df = pd.DataFrame(daily_data)
             df['dt'] = pd.to_datetime(df['date'])
-            df = df.set_index('dt').sort_index() # 날짜 오름차순으로 정렬
+            df = df.set_index('dt').sort_index()
 
-            # 데이터 클리닝 함수
             def clean_numeric_str(series):
-                # 쉼표, + 기호 제거 및 -- 를 - 로 변경
                 cleaned_series = series.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
                 return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
 
@@ -260,43 +288,43 @@ def display_stock_chart(stock_code):
             df['orgn_netprps'] = clean_numeric_str(df['orgn_netprps'])
             df['ind_netprps'] = clean_numeric_str(df['ind_netprps'])
 
-            # 3. 3단 종합 차트 그리기
-            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 15), sharex=True, gridspec_kw={'height_ratios': [2, 1, 1]})
+            # 3. 주간, 월간 데이터 리샘플링
+            agg_rules = {
+                'close_pric': 'last',
+                'for_netprps': 'sum',
+                'orgn_netprps': 'sum',
+                'ind_netprps': 'sum',
+                'for_rt': 'last'
+            }
+            df_weekly = df.resample('W').agg(agg_rules).dropna(subset=['close_pric'])
+            df_monthly = df.resample('M').agg(agg_rules).dropna(subset=['close_pric'])
+
+            # 4. 기간별로 데이터 필터링
+            now = pd.Timestamp.now()
+            df_daily_filtered = df[df.index >= (now - pd.DateOffset(months=3))]
+            df_weekly_filtered = df_weekly[df_weekly.index >= (now - pd.DateOffset(months=6))]
+            df_monthly_filtered = df_monthly[df_monthly.index >= (now - pd.DateOffset(months=12))]
+
+            # 5. 3x3 종합 차트 그리기
+            st.header("종합 분석 차트")
+            fig, axes = plt.subplots(3, 3, figsize=(18, 15), constrained_layout=True)
             fig.suptitle(f'{stock_code} 종합 분석 차트', fontsize=20)
 
-            # 상단: 주가 차트
-            ax1.plot(df.index, df['close_pric'], label='Closing Price', color='dodgerblue')
-            if len(df) >= 5:
-                moving_average = df['close_pric'].rolling(window=5).mean()
-                ax1.plot(moving_average.index, moving_average, label='5-Day MA', color='orange', linestyle='--')
-            ax1.set_title('주가 추이 (Price Trend)', fontsize=14)
-            ax1.set_ylabel('Price')
-            ax1.legend()
-            ax1.grid(True, linestyle='--', alpha=0.6)
+            # --- Row 1: Price ---
+            plot_price_chart(axes[0, 0], df_daily_filtered, "일봉 (3개월)")
+            plot_price_chart(axes[0, 1], df_weekly_filtered, "주봉 (6개월)")
+            plot_price_chart(axes[0, 2], df_monthly_filtered, "월봉 (12개월)")
 
-            # 중단: 투자자별 순매수
-            ax2.bar(df.index, df['for_netprps'], label='Foreign', color='red', alpha=0.7)
-            ax2.bar(df.index, df['orgn_netprps'], label='Institution', color='blue', alpha=0.7)
-            ax2.bar(df.index, df['ind_netprps'], label='Individual', color='green', alpha=0.7)
-            ax2.axhline(0, color='gray', linestyle='--', linewidth=1)
-            ax2.set_title('투자자별 순매수 동향 (Net Buy Trend by Investor)', fontsize=14)
-            ax2.set_ylabel('Net Buy Amount (KRW 1M)')
-            ax2.legend()
-            ax2.grid(True, linestyle='--', alpha=0.6)
+            # --- Row 2: Net Buy ---
+            plot_net_buy_chart(axes[1, 0], df_daily_filtered, "일간 (3개월)")
+            plot_net_buy_chart(axes[1, 1], df_weekly_filtered, "주간 (6개월)")
+            plot_net_buy_chart(axes[1, 2], df_monthly_filtered, "월간 (12개월)")
 
-            # 하단: 외국인 보유율
-            ax3.plot(df.index, df['for_rt'], label='Foreign Ownership', color='forestgreen')
-            ax3.set_title('외국인 지분율 추이 (Foreign Ownership Trend)', fontsize=14)
-            ax3.set_ylabel('Ownership (%)')
-            ax3.legend()
-            ax3.grid(True, linestyle='--', alpha=0.6)
-            
-            if len(df.index) > 30:
-                from matplotlib.ticker import MaxNLocator
-                ax3.xaxis.set_major_locator(MaxNLocator(10))
-            
-            fig.autofmt_xdate()
-            plt.tight_layout(rect=[0, 0.03, 1, 0.97]) # suptitle과 겹치지 않게 조정
+            # --- Row 3: Ownership ---
+            plot_ownership_chart(axes[2, 0], df_daily_filtered, "일간 (3개월)")
+            plot_ownership_chart(axes[2, 1], df_weekly_filtered, "주간 (6개월)")
+            plot_ownership_chart(axes[2, 2], df_monthly_filtered, "월간 (12개월)")
+
             st.pyplot(fig)
 
         except Exception as e:

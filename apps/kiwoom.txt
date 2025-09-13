@@ -1,0 +1,80 @@
+import requests
+import json
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 주식 차트 및 투자자별 매매 차트 생성
+def create_combined_chart(token, stock_code):
+    # 1. 일봉 데이터 요청
+    endpoint = '/api/dostk/chart'
+    url = f'https://api.kiwoom.com{endpoint}'
+    headers = {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'authorization': f'Bearer {token}',
+        'api-id': 'ka10081',
+    }
+    data = {
+        'stk_cd': stock_code,
+        'base_dt': '20241108',  # 기준일자
+        'upd_stkpc_tp': '1',     # 수정주가구분
+    }
+    
+    response = requests.post(url, headers=headers, json=data)
+    daily_data = response.json().get('stk_dt_pole_chart_qry', [])
+
+    # 2. 투자자별 매매동향 요청
+    endpoint_trend = '/api/dostk/frgnistt'  # 외국인 매매동향
+    url_trend = f'https://api.kiwoom.com{endpoint_trend}'
+    data_trend = {
+        'stk_cd': stock_code,
+    }
+    
+    response_trend = requests.post(url_trend, headers=headers, json=data_trend)
+    trend_data = response_trend.json().get('stk_frgnr', [])
+
+    # 3. 차트 그리기
+    dates = [day['dt'] for day in daily_data]
+    closing_prices = [float(day['cur_prc']) for day in daily_data]
+    
+    # 순매수 데이터 초기화
+    foreign_net_buy = [0] * len(dates)
+    institution_net_buy = [0] * len(dates)
+    individual_net_buy = [0] * len(dates)
+
+    # 4. 순매수 데이터 수집
+    for trend in trend_data:
+        if trend['stk_cd'] == stock_code:
+            foreign_net_buy.append(float(trend['frgnr_nettrde_qty']))
+            institution_net_buy.append(float(trend['orgn_nettrde_qty']))
+            individual_net_buy.append(float(trend['nettrde_qty']))
+
+    plt.figure(figsize=(14, 7))
+
+    # 5. 주식 차트
+    plt.subplot(2, 1, 1)
+    plt.plot(dates, closing_prices, label='Closing Price', color='blue')
+    plt.title(f'Stock Daily Chart for {stock_code}')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.xticks(rotation=45)
+
+    # 6. 투자자별 순매수 차트
+    plt.subplot(2, 1, 2)
+    plt.plot(dates, foreign_net_buy, label='Foreign Net Buy', color='red')
+    plt.plot(dates, institution_net_buy, label='Institution Net Buy', color='green')
+    plt.plot(dates, individual_net_buy, label='Individual Net Buy', color='orange')
+    plt.title('Investor Net Buying Trends')
+    plt.xlabel('Date')
+    plt.ylabel('Net Buy Quantity')
+    plt.legend()
+    plt.xticks(rotation=45)
+
+    plt.tight_layout()
+    plt.show()
+
+# 실행 구간
+if __name__ == '__main__':
+    MY_ACCESS_TOKEN = '[접근 토큰]'  # 접근토큰
+    stock_code = '005930'  # 삼성전자
+    create_combined_chart(MY_ACCESS_TOKEN, stock_code)

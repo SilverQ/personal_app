@@ -220,7 +220,6 @@ class KiwoomAPIHandler:
 
         df = pd.DataFrame(data_list)
 
-        # --- 날짜 컬럼 처리 ---
         date_col_map = {'stck_bsop_date': 'dt', 'date': 'dt', 'base_dt': 'dt', 'stck_dt': 'dt'}
         df.rename(columns=date_col_map, inplace=True)
         if 'dt' not in df.columns:
@@ -234,7 +233,6 @@ class KiwoomAPIHandler:
             cleaned_series = series_str.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
             return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
 
-        # --- OHLCV 및 기타 숫자 컬럼 처리 (수동 매핑) ---
         column_map = {
             'open': ['stck_oprc', 'open_pric'],
             'high': ['stck_hgpr', 'high_pric'],
@@ -351,6 +349,9 @@ def display_candlestick_chart(stock_code, company_name):
         return
 
     with st.spinner("캔들 차트 데이터를 조회하고 생성 중입니다..."):
+        # 주말만 제외하도록 rangebreaks 설정
+        rangebreaks = [dict(bounds=["sat", "mon"])]
+
         df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
 
         # --- Daily Chart (Fallback to Line Chart) ---
@@ -362,24 +363,27 @@ def display_candlestick_chart(stock_code, company_name):
             df_daily_fallback = st.session_state.kiwoom_handler.fetch_daily_fallback_data(stock_code)
             df_daily_filtered = df_daily_fallback[df_daily_fallback.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
 
-        # Plot Daily Chart
         if not df_daily_filtered.empty:
             daily_title = f'{company_name} 일봉 (3개월)'
+            fig = None
             if has_ohlc:
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=(daily_title, '거래량'), row_heights=[0.7, 0.3])
                 fig.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
                 if 'volume' in df_daily_filtered.columns:
                     colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
                     fig.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
-            else: # Fallback to line chart
+            else:
                 fig = make_subplots(rows=1, cols=1, subplot_titles=(daily_title,))
                 if 'close' in df_daily_filtered.columns:
                     fig.add_trace(go.Scatter(x=df_daily_filtered.index, y=df_daily_filtered['close'], mode='lines', name='종가'))
                 else:
                     st.error(f"일봉 대체 데이터에 'close' 컬럼이 없습니다. 사용 가능한 컬럼: {df_daily_filtered.columns.tolist()}")
-
-            fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
-            st.plotly_chart(fig, use_container_width=True)
+                    fig = None # 차트 생성 중단
+            
+            if fig:
+                fig.update_xaxes(rangebreaks=rangebreaks)
+                fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
+                st.plotly_chart(fig, use_container_width=True)
 
         # --- Weekly & Monthly Charts (Candlestick only) ---
         chart_data = {
@@ -406,6 +410,7 @@ def display_candlestick_chart(stock_code, company_name):
                 df['ma20'] = df['close'].rolling(window=20).mean()
                 fig.add_trace(go.Scatter(x=df.index, y=df['ma20'], name='MA 20', line=dict(color='purple', width=1)), row=1, col=1)
 
+            fig.update_xaxes(rangebreaks=rangebreaks)
             fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
             st.plotly_chart(fig, use_container_width=True)
 

@@ -9,440 +9,459 @@ import json
 import time
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# --- API Client Initialization ---
-# 스크립트 파일의 위치를 기준으로 config.ini 경로를 절대 경로로 계산합니다.
+# --- Constants and Paths ---
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(APP_DIR)
-config_path = os.path.join(ROOT_DIR, 'config.ini')
 
-# Config 파서 초기화
-config = configparser.ConfigParser()
-config.read(config_path)
+# --- Object-Oriented Handlers ---
 
-# Gemini API 키 설정
-gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-if not gemini_api_key:
-    try:
-        gemini_api_key = config.get('GEMINI_API_KEY', 'key', fallback=None)
-    except (configparser.NoSectionError, configparser.NoOptionError):
-        gemini_api_key = None
+class ConfigManager:
+    """Manages application configuration from config.ini."""
+    def __init__(self, root_dir):
+        self.config_path = os.path.join(root_dir, 'config.ini')
+        self.config = configparser.ConfigParser()
+        self.config.read(self.config_path)
 
-client = None
-if gemini_api_key:
-    try:
-        client = genai.Client(api_key=gemini_api_key)
-    except Exception as e:
-        st.error(f"Gemini API 클라이언트 초기화 중 오류가 발생했습니다: {e}")
-else:
-    st.warning("Gemini API 키를 찾을 수 없어 AI 분석 기능이 제한됩니다. 환경 변수 또는 config.ini 파일을 확인해주세요.")
+    def get_gemini_key(self):
+        """Retrieves the Gemini API key."""
+        gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not gemini_api_key:
+            try:
+                gemini_api_key = self.config.get('GEMINI_API_KEY', 'key', fallback=None)
+            except (configparser.NoSectionError, configparser.NoOptionError):
+                gemini_api_key = None
+        return gemini_api_key
 
-# Kiwoom API 키 설정
-try:
-    KIWOOM_APP_KEY = config.get('KIWOOM_API', 'appkey')
-    KIWOOM_APP_SECRET = config.get('KIWOOM_API', 'secretkey')
-    KIWOOM_API_MODE = config.get('KIWOOM_API', 'mode', fallback='mock')
-except (configparser.NoSectionError, configparser.NoOptionError):
-    KIWOOM_APP_KEY, KIWOOM_APP_SECRET, KIWOOM_API_MODE = None, None, 'mock'
-    st.warning("Kiwoom API 키를 찾을 수 없어 시세 조회가 제한됩니다. config.ini 파일을 확인해주세요.")
+    def get_kiwoom_config(self):
+        """Retrieves Kiwoom API configuration."""
+        try:
+            app_key = self.config.get('KIWOOM_API', 'appkey')
+            app_secret = self.config.get('KIWOOM_API', 'secretkey')
+            mode = self.config.get('KIWOOM_API', 'mode', fallback='mock')
+            base_url = "https://api.kiwoom.com" if mode == 'real' else "https://mockapi.kiwoom.com"
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            st.warning("Kiwoom API 키를 찾을 수 없어 시세 조회가 제한됩니다. config.ini 파일을 확인해주세요.")
+            return None, None, 'mock', 'https://mockapi.kiwoom.com'
+        return app_key, app_secret, mode, base_url
 
-# Kiwoom API URL 설정
-if KIWOOM_API_MODE == 'real':
-    KIWOOM_BASE_URL = "https://api.kiwoom.com"
-else:
-    KIWOOM_BASE_URL = "https://mockapi.kiwoom.com"
+class GeminiAPIHandler:
+    """Handles interactions with the Gemini API."""
+    def __init__(self, api_key):
+        self.client = None
+        if api_key:
+            try:
+                self.client = genai.Client(api_key=api_key)
+            except Exception as e:
+                st.error(f"Gemini API 클라이언트 초기화 중 오류가 발생했습니다: {e}")
+        else:
+            st.warning("Gemini API 키를 찾을 수 없어 AI 분석 기능이 제한됩니다. 환경 변수 또는 config.ini 파일을 확인해주세요.")
 
+    def generate_content(self, prompt, system_instruction):
+        """Generates content using the Gemini API."""
+        if self.client is None:
+            return "오류: Gemini 클라이언트가 초기화되지 않았습니다."
+        try:
+            combined_prompt = f"{system_instruction}\n\n{prompt}"
+            response = self.client.models.generate_content(model='models/gemini-1.5-flash', contents=combined_prompt)
+            return response.text
+        except Exception as e:
+            st.error("Gemini API 호출 중 오류가 발생했습니다.")
+            st.exception(e)
+            return "오류로 인해 분석 내용을 생성할 수 없습니다."
 
-@st.cache_data(ttl=86400) # 24시간 동안 캐시
-def get_stock_list():
-    """apps/stock_list.csv 파일에서 전체 상장 종목 리스트를 가져오는 함수"""
-    try:
-        stock_list_path = os.path.join(APP_DIR, 'stock_list.csv')
-        df_listing = pd.read_csv(stock_list_path, dtype={'code': str, 'name': str})
-        if 'name' not in df_listing.columns or 'code' not in df_listing.columns:
-            st.error("'apps/stock_list.csv' 파일에 'name' 또는 'code' 컬럼이 없습니다.")
-            return pd.DataFrame()
-    except FileNotFoundError:
-        st.error("'apps/stock_list.csv' 파일을 찾을 수 없습니다.")
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"종목 리스트 로딩 중 오류 발생: {e}")
-        return pd.DataFrame()
-    return df_listing
+class KiwoomAPIHandler:
+    """Handles interactions with the Kiwoom REST API."""
+    def __init__(self, app_key, app_secret, base_url):
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.base_url = base_url
 
-def get_kiwoom_token():
-    """키움 API 접근 토큰을 발급받고 세션에 저장하는 함수"""
-    if not KIWOOM_APP_KEY or not KIWOOM_APP_SECRET:
-        st.error("키움 API 키가 설정되지 않았습니다. config.ini 파일을 확인하세요.")
-        return None
-
-    if 'kiwoom_token' in st.session_state and st.session_state.kiwoom_token_expires_at > time.time():
-        return st.session_state.kiwoom_token
-
-    url = f"{KIWOOM_BASE_URL}/oauth2/token"
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "grant_type": "client_credentials",
-        "appkey": KIWOOM_APP_KEY,
-        "secretkey": KIWOOM_APP_SECRET
-    }
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(data))
-        response.raise_for_status()
-        token_data = response.json()
-
-        if 'token' not in token_data:
-            st.error("키움 API 토큰 발급 실패: 응답에 'token'이 없습니다.")
-            st.json(token_data)
+    def get_token(self):
+        """Fetches and caches the Kiwoom API token."""
+        if not self.app_key or not self.app_secret:
+            st.error("키움 API 키가 설정되지 않았습니다. config.ini 파일을 확인하세요.")
             return None
 
-        st.session_state.kiwoom_token = token_data['token']
-        
-        if 'expires_dt' in token_data:
-            try:
-                expires_ts = pd.to_datetime(token_data['expires_dt'], format='%Y%m%d%H%M%S').timestamp()
-                st.session_state.kiwoom_token_expires_at = expires_ts - 60
-            except ValueError:
-                st.session_state.kiwoom_token_expires_at = time.time() + 3600 - 60
-        else:
-            expires_in = int(token_data.get('expires_in', 3600))
-            st.session_state.kiwoom_token_expires_at = time.time() + expires_in - 60
-            
-        return st.session_state.kiwoom_token
-    except requests.exceptions.RequestException as e:
-        st.error(f"키움 API 토큰 발급 중 오류 발생: {e}")
-        if e.response:
-            st.error(f"응답 내용: {e.response.text}")
-        return None
-    except json.JSONDecodeError:
-        st.error(f"키움 API 토큰 응답이 JSON 형식이 아닙니다. 응답: {response.text}")
-        return None
+        if 'kiwoom_token' in st.session_state and st.session_state.kiwoom_token_expires_at > time.time():
+            return st.session_state.kiwoom_token
 
-def get_kiwoom_stock_info(stock_code):
-    """키움 API를 사용하여 주식의 상세 정보를 가져오는 함수"""
-    token = get_kiwoom_token()
-    if not token:
-        return {}
+        url = f"{self.base_url}/oauth2/token"
+        headers = {"Content-Type": "application/json"}
+        data = {
+            "grant_type": "client_credentials",
+            "appkey": self.app_key,
+            "secretkey": self.app_secret
+        }
+        response = None
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(data))
+            response.raise_for_status()
+            token_data = response.json()
 
-    url = f"{KIWOOM_BASE_URL}/api/dostk/stkinfo"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "authorization": f"Bearer {token}",
-        "appkey": KIWOOM_APP_KEY,
-        "appsecret": KIWOOM_APP_SECRET,
-        "api-id": "ka10001"
-    }
-    params = {"stk_cd": stock_code}
+            if 'token' not in token_data and 'access_token' in token_data:
+                token_data['token'] = token_data['access_token']
 
-    try:
-        response = requests.post(url, headers=headers, json=params)
-        response.raise_for_status()
-        data = response.json()
+            if 'token' not in token_data:
+                st.error("키움 API 토큰 발급 실패: 응답에 'token' 또는 'access_token'이 없습니다.")
+                st.json(token_data)
+                return None
 
-        if data.get('return_code') != 0:
-            st.error(f"키움 API 오류: {data.get('return_msg', '상세 메시지 없음')}")
-            st.json(data)
+            st.session_state.kiwoom_token = token_data['token']
+
+            if 'expires_dt' in token_data:
+                try:
+                    expires_ts = pd.to_datetime(token_data['expires_dt'], format='%Y%m%d%H%M%S').timestamp()
+                    st.session_state.kiwoom_token_expires_at = expires_ts - 60
+                except ValueError:
+                    st.session_state.kiwoom_token_expires_at = time.time() + 3600 - 60
+            else:
+                expires_in = int(token_data.get('expires_in', 3600))
+                st.session_state.kiwoom_token_expires_at = time.time() + expires_in - 60
+
+            return st.session_state.kiwoom_token
+        except requests.exceptions.RequestException as e:
+            st.error(f"키움 API 토큰 발급 중 오류 발생: {e}")
+            if e.response:
+                st.error(f"응답 내용: {e.response.text}")
+            return None
+        except json.JSONDecodeError:
+            st.error(f"키움 API 토큰 응답이 JSON 형식이 아닙니다. 응답: {response.text if response else 'N/A'}")
+            return None
+
+    def get_stock_info(self, stock_code):
+        """Fetches detailed stock information."""
+        token = self.get_token()
+        if not token:
             return {}
 
-        def clean_value(value_str):
-            if isinstance(value_str, str) and value_str:
-                try:
-                    return float(value_str.replace('+', '').replace('-', ''))
-                except ValueError:
-                    return 0.0
-            elif isinstance(value_str, (int, float)):
-                return float(value_str)
-            return 0.0
-
-        info = {
-            'price': clean_value(data.get('cur_prc', 0)),
-            'market_cap': int(clean_value(data.get('mac', 0)) * 100000000),
-            'per': clean_value(data.get('per', 0)),
-            'pbr': clean_value(data.get('pbr', 0)),
-            'eps': clean_value(data.get('eps', 0)),
-            'bps': clean_value(data.get('bps', 0)),
-            'roe': clean_value(data.get('roe', 0)),
-            'high_52w': clean_value(data.get('250hgst', 0)),
-            'low_52w': clean_value(data.get('250lwst', 0)),
+        url = f"{self.base_url}/api/dostk/stkinfo"
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "api-id": "ka10001"
         }
-        return info
-    except requests.exceptions.RequestException as e:
-        st.error(f"키움 API (stkinfo) 호출 중 오류 발생: {e}")
-        if e.response:
-            st.error(f"응답 내용: {e.response.text}")
-        return {}
-    except (ValueError, TypeError, json.JSONDecodeError) as e:
-        st.error(f"API 응답 데이터 처리 중 오류 발생: {e}")
-        return {}
+        params = {"stk_cd": stock_code}
+
+        try:
+            response = requests.post(url, headers=headers, json=params)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get('return_code') != 0:
+                st.error(f"키움 API 오류: {data.get('return_msg', '상세 메시지 없음')}")
+                st.json(data)
+                return {}
+
+            def clean_value(value_str):
+                if isinstance(value_str, str) and value_str:
+                    try:
+                        return float(value_str.replace('+', '').replace('-', ''))
+                    except ValueError:
+                        return 0.0
+                elif isinstance(value_str, (int, float)):
+                    return float(value_str)
+                return 0.0
+
+            info = {
+                'price': clean_value(data.get('cur_prc', 0)),
+                'market_cap': int(clean_value(data.get('mac', 0)) * 100000000),
+                'per': clean_value(data.get('per', 0)),
+                'pbr': clean_value(data.get('pbr', 0)),
+                'eps': clean_value(data.get('eps', 0)),
+                'bps': clean_value(data.get('bps', 0)),
+                'roe': clean_value(data.get('roe', 0)),
+                'high_52w': clean_value(data.get('250hgst', 0)),
+                'low_52w': clean_value(data.get('250lwst', 0)),
+            }
+            return info
+        except requests.exceptions.RequestException as e:
+            st.error(f"키움 API (stkinfo) 호출 중 오류 발생: {e}")
+            if e.response:
+                st.error(f"응답 내용: {e.response.text}")
+            return {}
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            st.error(f"API 응답 데이터 처리 중 오류 발생: {e}")
+            return {}
+
+    def _fetch_chart_data(self, token, api_id, endpoint, params):
+        url = f'{self.base_url}{endpoint}'
+        headers = {
+            'Content-Type': 'application/json;charset=UTF-8',
+            'authorization': f'Bearer {token}',
+            'appkey': self.app_key,
+            'appsecret': self.app_secret,
+            'api-id': api_id,
+        }
+        try:
+            response = requests.post(url, headers=headers, json=params)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('return_code') != 0:
+                return []
+
+            for key, value in response_data.items():
+                if isinstance(value, list) and value:
+                    return value
+            return []
+        except requests.exceptions.RequestException:
+            return []
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return []
+
+    def _process_chart_dataframe(self, data_list):
+        if not data_list:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data_list)
+
+        # --- 날짜 컬럼 처리 ---
+        date_col_map = {'stck_bsop_date': 'dt', 'date': 'dt', 'base_dt': 'dt', 'stck_dt': 'dt'}
+        df.rename(columns=date_col_map, inplace=True)
+        if 'dt' not in df.columns:
+            st.error(f"API 응답에서 날짜 컬럼을 찾을 수 없습니다. 사용 가능한 컬럼: {df.columns.tolist()}")
+            return pd.DataFrame()
+        df['dt'] = pd.to_datetime(df['dt'])
+        df = df.set_index('dt').sort_index()
+
+        def clean_and_convert_to_numeric(series):
+            series_str = series.astype(str)
+            cleaned_series = series_str.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
+            return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
+
+        # --- OHLCV 및 기타 숫자 컬럼 처리 (수동 매핑) ---
+        column_map = {
+            'open': ['stck_oprc', 'open_pric'],
+            'high': ['stck_hgpr', 'high_pric'],
+            'low': ['stck_lwpr', 'low_pric'],
+            'close': ['stck_clpr', 'cur_prc', 'clpr', 'stck_prpr', 'close_pric'],
+            'volume': ['acml_vol', 'trde_qty'],
+            'for_rt': ['for_rt'],
+            'for_netprps': ['for_netprps'],
+            'orgn_netprps': ['orgn_netprps'],
+            'ind_netprps': ['ind_netprps']
+        }
+
+        for standard_name, possible_names in column_map.items():
+            for name in possible_names:
+                if name in df.columns:
+                    df[standard_name] = clean_and_convert_to_numeric(df[name])
+                    break
+        
+        return df
+
+    def fetch_all_chart_data(self, stock_code):
+        token = self.get_token()
+        if not token:
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+        now = pd.Timestamp.now()
+        now_str = now.strftime('%Y%m%d')
+
+        daily_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'D', 'upd_stkpc_tp': '1'}
+        daily_list = self._fetch_chart_data(token, 'ka10081', '/api/dostk/chart', daily_params)
+        df_daily = self._process_chart_dataframe(daily_list)
+
+        weekly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'W', 'upd_stkpc_tp': '1'}
+        weekly_list = self._fetch_chart_data(token, 'ka10082', '/api/dostk/chart', weekly_params)
+        df_weekly = self._process_chart_dataframe(weekly_list)
+
+        monthly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'M', 'upd_stkpc_tp': '1'}
+        monthly_list = self._fetch_chart_data(token, 'ka10083', '/api/dostk/chart', monthly_params)
+        df_monthly = self._process_chart_dataframe(monthly_list)
+
+        return df_daily, df_weekly, df_monthly
+
+    def fetch_daily_fallback_data(self, stock_code):
+        """Fetches daily data (closing price) as a fallback for line charts."""
+        token = self.get_token()
+        if not token:
+            return pd.DataFrame()
+        now = pd.Timestamp.now()
+        now_str = now.strftime('%Y%m%d')
+        params = {'stk_cd': stock_code, 'qry_dt': now_str, 'indc_tp': '1'}
+        data_list = self._fetch_chart_data(token, 'ka10086', '/api/dostk/mrkcond', params)
+        return self._process_chart_dataframe(data_list)
+
+class ValuationCalculator:
+    @staticmethod
+    def calculate_target_pbr(roe, cost_of_equity, terminal_growth):
+        roe_pct, ke_pct, g_pct = roe / 100, cost_of_equity / 100, terminal_growth / 100
+        return (roe_pct - g_pct) / (ke_pct - g_pct) if (ke_pct - g_pct) != 0 else 0
+
+    @staticmethod
+    def calculate_target_price(target_pbr, bps):
+        return target_pbr * bps
+
+    @staticmethod
+    def get_investment_opinion(current_price, target_price):
+        if current_price <= 0 or target_price <= 0:
+            return "-", 0.0
+        upside = ((target_price / current_price) - 1) * 100
+        if upside > 15: return "매수 (Buy)", upside
+        if upside > -5: return "중립 (Neutral)", upside
+        return "매도 (Sell)", upside
+
+# --- Wrapper Functions ---
+
+def get_kiwoom_token():
+    if 'kiwoom_handler' not in st.session_state: return None
+    return st.session_state.kiwoom_handler.get_token()
+
+def get_kiwoom_stock_info(stock_code):
+    if 'kiwoom_handler' not in st.session_state: return {}
+    return st.session_state.kiwoom_handler.get_stock_info(stock_code)
 
 def generate_gemini_content(prompt, system_instruction):
-    """Gemini API를 호출하여 콘텐츠를 생성하는 함수"""
-    if client is None:
-        return "오류: Gemini 클라이언트가 초기화되지 않았습니다."
+    if 'gemini_handler' not in st.session_state: return "오류: Gemini 핸들러가 초기화되지 않았습니다."
+    return st.session_state.gemini_handler.generate_content(prompt, system_instruction)
+
+# --- UI and Data Functions ---
+
+@st.cache_data(ttl=86400)
+def get_stock_list():
     try:
-        combined_prompt = f"{system_instruction}\n\n{prompt}"
-        response = client.models.generate_content(model='models/gemini-1.5-flash', contents=combined_prompt)
-        return response.text
-    except Exception as e:
-        st.error("Gemini API 호출 중 오류가 발생했습니다.")
-        st.exception(e)
-        return "오류로 인해 분석 내용을 생성할 수 없습니다."
+        df = pd.read_csv(os.path.join(APP_DIR, 'stock_list.csv'), dtype={'code': str, 'name': str})
+        if 'name' not in df.columns or 'code' not in df.columns: return pd.DataFrame()
+        return df
+    except Exception: return pd.DataFrame()
 
 def get_empty_forecast_df():
-    """실적 전망 테이블을 위한 빈 데이터프레임을 생성하는 함수"""
-    data = {
-        '(단위: 십억원)': ['매출액', '영업이익', '순이익', 'EPS (원)', 'BPS (원)', 'ROE (%)'],
-        '2023A': [0.0] * 6, '2024E': [0.0] * 6, '2025E': [0.0] * 6
-    }
+    data = {'(단위: 십억원)': ['매출액', '영업이익', '순이익', 'EPS (원)', 'BPS (원)', 'ROE (%)'],
+            '2023A': [0.0]*6, '2024E': [0.0]*6, '2025E': [0.0]*6}
     return pd.DataFrame(data).set_index('(단위: 십억원)').astype(float)
 
 def reset_states_on_stock_change():
-    """사용자가 새 기업을 선택했을 때 관련 세션 상태를 초기화하는 콜백 함수"""
     st.session_state.gemini_analysis = "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요."
     st.session_state.main_business = "-"
     st.session_state.investment_summary = "-"
     st.session_state.kiwoom_data = {}
     st.session_state.df_forecast = get_empty_forecast_df()
 
-def plot_price_chart(ax, df, title):
-    """주가 차트를 그리는 헬퍼 함수"""
-    ax.plot(df.index, df['close_pric'], label='Price', color='dodgerblue')
-    if len(df) >= 5:
-        ma = df['close_pric'].rolling(window=5).mean()
-        ax.plot(ma.index, ma, label='5-Period MA', color='orange', linestyle='--')
-    ax.set_title(title, fontsize=12)
-    ax.set_ylabel('Price')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.6)
+# --- Plotting Functions ---
 
-def plot_net_buy_chart(ax, df, title):
-    """투자자별 순매수 차트를 그리는 헬퍼 함수"""
-    ax.bar(df.index, df['for_netprps'], label='Foreign', color='red', alpha=0.7)
-    ax.bar(df.index, df['orgn_netprps'], label='Institution', color='blue', alpha=0.7)
-    ax.bar(df.index, df['ind_netprps'], label='Individual', color='green', alpha=0.7)
-    ax.axhline(0, color='gray', linestyle='--', linewidth=1)
-    ax.set_title(title, fontsize=12)
-    ax.set_ylabel('Amount (KRW 1M)')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.6)
-
-def plot_ownership_chart(ax, df, title):
-    """외국인 지분율 차트를 그리는 헬퍼 함수"""
-    ax.plot(df.index, df['for_rt'], label='Ownership', color='forestgreen')
-    ax.set_title(title, fontsize=12)
-    ax.set_ylabel('Ownership (%)')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.6)
-
-
-def _fetch_kiwoom_chart_data(token, api_id, endpoint, params):
-    """Helper to fetch data for charts from a specific Kiwoom endpoint."""
-    url = f'{KIWOOM_BASE_URL}{endpoint}'
-    headers = {
-        'Content-Type': 'application/json;charset=UTF-8',
-        'authorization': f'Bearer {token}',
-        'appkey': KIWOOM_APP_KEY,
-        'appsecret': KIWOOM_APP_SECRET,
-        'api-id': api_id,
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=params)
-        response.raise_for_status()
-        
-        response_data = response.json()
-
-        if response_data.get('return_code') != 0:
-            st.error(f"API 조회 실패 ({api_id}): {response_data.get('return_msg')}")
-            st.json(response_data)
-            return []
-
-        # Find the list of data in the response
-        for key, value in response_data.items():
-            if isinstance(value, list) and value:
-                return value
-        
-        st.warning(f"차트 데이터를 가져올 수 없습니다 ({api_id}). 응답에서 데이터 목록을 찾을 수 없습니다.")
-        return []
-    except requests.exceptions.RequestException as e:
-        st.error(f"Kiwoom API ({api_id}) 호출 중 오류 발생: {e}")
-        if e.response:
-            st.error(f"응답 내용: {e.response.text}")
-        return []
-    except (ValueError, TypeError, json.JSONDecodeError) as e:
-        st.error(f"API 응답 데이터 처리 중 오류 발생 ({api_id}): {e}")
-        return []
-
-
-def _process_chart_dataframe(data_list):
-    """Helper to process raw chart data into a clean DataFrame."""
-    if not data_list:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(data_list)
-
-    date_col = None
-    # Find date column from a list of possible names
-    for col_name in ['date', 'dt', 'stck_bsop_date', 'base_dt', 'stck_dt']:
-        if col_name in df.columns:
-            date_col = col_name
-            break
-    
-    if not date_col:
-        st.error("응답에서 날짜 정보를 찾을 수 없습니다.")
-        return pd.DataFrame()
-        
-    df['dt'] = pd.to_datetime(df[date_col])
-    df = df.set_index('dt').sort_index()
-
-    def clean_numeric_str(series):
-        series_str = series.astype(str)
-        cleaned_series = series_str.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
-        return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
-
-    # Standardize price column name ('cur_prc' or 'stck_clpr' -> 'close_pric')
-    price_cols = {'cur_prc': 'close_pric', 'stck_clpr': 'close_pric', 'clpr': 'close_pric'}
-    df.rename(columns=price_cols, inplace=True)
-
-    # Clean all relevant numeric columns if they exist
-    all_cols = ['close_pric', 'for_rt', 'for_netprps', 'orgn_netprps', 'ind_netprps']
-    for col in all_cols:
-        if col in df.columns:
-            df[col] = clean_numeric_str(df[col])
-
-    return df
-
-
-def display_stock_chart(stock_code):
-    """키움 API를 사용하여 주가, 투자자별 매매동향, 외국인 보유율 종합 차트를 생성하고 Streamlit에 표시하는 함수"""
-    token = get_kiwoom_token()
-    if not token:
-        st.error("차트를 생성하려면 키움 토큰이 필요합니다.")
+def display_candlestick_chart(stock_code, company_name):
+    if 'kiwoom_handler' not in st.session_state:
+        st.error("차트를 생성하려면 Kiwoom 핸들러가 필요합니다.")
         return
 
-    with st.spinner("종합 차트 데이터를 조회하고 생성 중입니다..."):
-        try:
-            now = pd.Timestamp.now()
-            now_str = now.strftime('%Y%m%d')
+    with st.spinner("캔들 차트 데이터를 조회하고 생성 중입니다..."):
+        df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
 
-            # 1. Fetch Daily Data (has investor info)
-            daily_params = {'stk_cd': stock_code, 'qry_dt': now_str, 'indc_tp': '1'}
-            daily_list = _fetch_kiwoom_chart_data(token, 'ka10086', '/api/dostk/mrkcond', daily_params)
-            df_daily = _process_chart_dataframe(daily_list)
+        # --- Daily Chart (Fallback to Line Chart) ---
+        df_daily_filtered = df_daily[df_daily.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
+        has_ohlc = not df_daily_filtered.empty and all(col in df_daily_filtered.columns for col in ['open', 'high', 'low', 'close'])
 
-            # 2. Fetch Weekly Data (price only)
-            weekly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'W', 'upd_stkpc_tp': '1'}
-            weekly_list = _fetch_kiwoom_chart_data(token, 'ka10082', '/api/dostk/chart', weekly_params)
-            df_weekly = _process_chart_dataframe(weekly_list)
+        if not has_ohlc:
+            st.warning("API에서 일봉 OHLC 데이터를 제공하지 않아, 종가 기준 꺾은선 차트를 표시합니다.")
+            df_daily_fallback = st.session_state.kiwoom_handler.fetch_daily_fallback_data(stock_code)
+            df_daily_filtered = df_daily_fallback[df_daily_fallback.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
 
-            # 3. Fetch Monthly Data (price only)
-            monthly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'M', 'upd_stkpc_tp': '1'}
-            monthly_list = _fetch_kiwoom_chart_data(token, 'ka10083', '/api/dostk/chart', monthly_params)
-            df_monthly = _process_chart_dataframe(monthly_list)
+        # Plot Daily Chart
+        if not df_daily_filtered.empty:
+            daily_title = f'{company_name} 일봉 (3개월)'
+            if has_ohlc:
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=(daily_title, '거래량'), row_heights=[0.7, 0.3])
+                fig.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
+                if 'volume' in df_daily_filtered.columns:
+                    colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
+                    fig.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
+            else: # Fallback to line chart
+                fig = make_subplots(rows=1, cols=1, subplot_titles=(daily_title,))
+                if 'close' in df_daily_filtered.columns:
+                    fig.add_trace(go.Scatter(x=df_daily_filtered.index, y=df_daily_filtered['close'], mode='lines', name='종가'))
+                else:
+                    st.error(f"일봉 대체 데이터에 'close' 컬럼이 없습니다. 사용 가능한 컬럼: {df_daily_filtered.columns.tolist()}")
 
-            # 4. Filter data for plotting
-            df_daily_filtered = df_daily[df_daily.index >= (now - pd.DateOffset(months=3))] if not df_daily.empty else pd.DataFrame()
-            df_weekly_filtered = df_weekly[df_weekly.index >= (now - pd.DateOffset(months=6))] if not df_weekly.empty else pd.DataFrame()
-            df_monthly_filtered = df_monthly[df_monthly.index >= (now - pd.DateOffset(months=12))] if not df_monthly.empty else pd.DataFrame()
+            fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
+            st.plotly_chart(fig, use_container_width=True)
 
-            if df_daily_filtered.empty and df_weekly_filtered.empty and df_monthly_filtered.empty:
-                st.warning("차트 데이터를 표시할 수 없습니다.")
-                return
+        # --- Weekly & Monthly Charts (Candlestick only) ---
+        chart_data = {
+            '주봉 (1년)': df_weekly[df_weekly.index >= (pd.Timestamp.now() - pd.DateOffset(years=1))],
+            '월봉 (3년)': df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))]
+        }
 
-            # 5. Plotting
-            st.header("종합 분석 차트")
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
-            fig.suptitle(f'{stock_code} 종합 분석 차트', fontsize=20)
+        for title, df in chart_data.items():
+            if df.empty or not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+                st.warning(f"{title} 데이터를 표시할 수 없습니다. (필수 데이터 부족)")
+                continue
 
-            # --- Row 1: Price Charts ---
-            if not df_daily_filtered.empty: plot_price_chart(axes[0, 0], df_daily_filtered, "일봉 (3개월)")
-            if not df_weekly_filtered.empty: plot_price_chart(axes[0, 1], df_weekly_filtered, "주봉 (6개월)")
-            if not df_monthly_filtered.empty: plot_price_chart(axes[0, 2], df_monthly_filtered, "월봉 (12개월)")
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=(f'{company_name} {title}', '거래량'), row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='캔들'), row=1, col=1)
 
-            # --- Row 2: Daily Investor Info ---
-            net_buy_cols = ['for_netprps', 'orgn_netprps', 'ind_netprps']
-            if not df_daily_filtered.empty and all(c in df_daily_filtered.columns for c in net_buy_cols):
-                plot_net_buy_chart(axes[1, 0], df_daily_filtered, "일간 투자자별 순매수 (3개월)")
-            
-            ownership_col = 'for_rt'
-            if not df_daily_filtered.empty and ownership_col in df_daily_filtered.columns:
-                plot_ownership_chart(axes[1, 1], df_daily_filtered, "일간 외국인 지분율 (3개월)")
+            if 'volume' in df.columns:
+                colors = ['red' if c < o else 'green' for o, c in zip(df['open'], df['close'])]
+                fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='거래량', marker_color=colors), row=2, col=1)
 
-            # Turn off the unused subplot
-            axes[1, 2].axis('off')
+            if len(df) >= 5:
+                df['ma5'] = df['close'].rolling(window=5).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=df['ma5'], name='MA 5', line=dict(color='orange', width=1)), row=1, col=1)
+            if len(df) >= 20:
+                df['ma20'] = df['close'].rolling(window=20).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=df['ma20'], name='MA 20', line=dict(color='purple', width=1)), row=1, col=1)
 
-            st.pyplot(fig)
+            fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
+            st.plotly_chart(fig, use_container_width=True)
 
-        except Exception as e:
-            st.error(f"차트 생성 중 오류 발생: {e}")
-            st.exception(e)
+# --- Main Application ---
 
 def main():
     st.set_page_config(layout="wide")
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
 
-    # --- Robust Session State Initialization ---
-    if "gemini_analysis" not in st.session_state:
-        st.session_state.gemini_analysis = "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요."
-    if "main_business" not in st.session_state:
-        st.session_state.main_business = "-"
-    if "investment_summary" not in st.session_state:
-        st.session_state.investment_summary = "-"
-    if "kiwoom_data" not in st.session_state:
-        st.session_state.kiwoom_data = {}
-    if "df_forecast" not in st.session_state:
-        st.session_state.df_forecast = get_empty_forecast_df()
-    if "kiwoom_token" not in st.session_state:
-        st.session_state.kiwoom_token = None
-    if "kiwoom_token_expires_at" not in st.session_state:
-        st.session_state.kiwoom_token_expires_at = 0
-    if "gemini_api_calls" not in st.session_state:
-        st.session_state.gemini_api_calls = 0
+    if 'config_manager' not in st.session_state: st.session_state.config_manager = ConfigManager(ROOT_DIR)
+    if 'gemini_handler' not in st.session_state: st.session_state.gemini_handler = GeminiAPIHandler(st.session_state.config_manager.get_gemini_key())
+    if 'kiwoom_handler' not in st.session_state:
+        k_key, k_secret, _, k_url = st.session_state.config_manager.get_kiwoom_config()
+        st.session_state.kiwoom_handler = KiwoomAPIHandler(k_key, k_secret, k_url)
+
+    states_to_init = {
+        "gemini_analysis": "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요.",
+        "main_business": "-", "investment_summary": "-", "kiwoom_data": {},
+        "df_forecast": get_empty_forecast_df(), "gemini_api_calls": 0,
+        "kiwoom_token": None, "kiwoom_token_expires_at": 0
+    }
+    for key, value in states_to_init.items():
+        if key not in st.session_state: st.session_state[key] = value
 
     title_col, info_col = st.columns([3, 1])
-    with title_col:
-        st.title("AI 기반 투자 분석 리포트")
-    with info_col:
-        st.markdown(f"<div style='text-align: right;'><b>조회 기준일:</b> {today_str}<br><b>애널리스트:</b> Gemini 1.5 Flash</div>", unsafe_allow_html=True)
-
+    with title_col: st.title("AI 기반 투자 분석 리포트")
+    with info_col: st.markdown(f"<div style='text-align: right;'><b>조회 기준일:</b> {today_str}<br><b>애널리스트:</b> Gemini 1.5 Flash</div>", unsafe_allow_html=True)
     st.divider()
 
     with st.expander("⚙️ 분석 설정 (기업, 모델 변수 등)", expanded=True):
         col1, col2, col3 = st.columns([2, 2, 1])
-
         with col1:
             st.markdown("**분석 대상**")
             df_listing = get_stock_list()
-            
             if not df_listing.empty:
                 df_listing['display'] = df_listing['name'] + ' (' + df_listing['code'] + ')'
                 stock_options = df_listing['display'].tolist()
                 default_index = stock_options.index("SK하이닉스 (000660)") if "SK하이닉스 (000660)" in stock_options else 0
-                
-                selected_stock = st.selectbox("기업 선택", stock_options, index=default_index, help="기업 변경 시 분석 내용은 초기화됩니다.", on_change=reset_states_on_stock_change, key='selected_stock', label_visibility="collapsed")
-                match = re.match(r"(.+) \((.+)\)", selected_stock)
-                company_name, stock_code = match.groups() if match else ("", "")
+                selected_stock = st.selectbox("기업 선택", stock_options, index=default_index, on_change=reset_states_on_stock_change, key='selected_stock', label_visibility="collapsed")
+                company_name, stock_code = re.match(r"(.+) \((.+)\)", selected_stock).groups() if selected_stock else ("", "")
             else:
-                st.warning("종목 리스트를 불러오지 못했습니다.")
-                company_name = st.text_input("기업명", "SK하이닉스")
-                stock_code = st.text_input("종목코드", "000660")
+                company_name, stock_code = st.text_input("기업명", "SK하이닉스"), st.text_input("종목코드", "000660")
 
             btn_cols = st.columns(2)
-            if btn_cols[0].button("📈 정보 조회", help="키움 API를 통해 최신 시세와 주요 투자 지표를 가져옵니다.", use_container_width=True):
+            if btn_cols[0].button("📈 정보 조회", use_container_width=True):
                 with st.spinner("키움 API에서 최신 정보를 조회 중입니다..."):
                     kiwoom_data = get_kiwoom_stock_info(stock_code)
                     if kiwoom_data:
                         st.session_state.kiwoom_data = kiwoom_data
                         df_new = st.session_state.df_forecast.copy()
-                        df_new.loc['EPS (원)', '2023A'] = kiwoom_data.get('eps', 0)
-                        df_new.loc['BPS (원)', '2023A'] = kiwoom_data.get('bps', 0)
-                        df_new.loc['ROE (%)', '2023A'] = kiwoom_data.get('roe', 0)
+                        df_new.loc['EPS (원)', '2023A'], df_new.loc['BPS (원)', '2023A'], df_new.loc['ROE (%)', '2023A'] = kiwoom_data.get('eps', 0), kiwoom_data.get('bps', 0), kiwoom_data.get('roe', 0)
                         st.session_state.df_forecast = df_new
                         st.success("정보 조회가 완료되었습니다.")
-                    else:
-                        st.error("정보 조회에 실패했습니다.")
+                    else: st.error("정보 조회에 실패했습니다.")
 
-            if btn_cols[1].button("✨ AI 분석", help="최신 뉴스와 데이터를 바탕으로 투자 포인트와 리스크 요인을 새로 분석합니다.", use_container_width=True):
+            if btn_cols[1].button("✨ AI 분석", use_container_width=True):
                 st.session_state.gemini_api_calls += 1
                 with st.spinner('Gemini가 최신 정보를 분석 중입니다...'):
                     system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
@@ -478,104 +497,75 @@ def main():
                         st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
                         st.session_state.gemini_analysis = "###" + "###".join(parts[3:])
                     except Exception:
-                        st.session_state.main_business = "-"
-                        st.session_state.investment_summary = "-"
+                        st.session_state.main_business, st.session_state.investment_summary = "-", "-"
                         st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{full_response}"
-            
-            st.caption(f"AI 분석 호출 (이번 세션): {st.session_state.gemini_api_calls} / 25 (일일 한도)")
-            st.caption("_분당 5회 초과 시 오류가 발생할 수 있습니다._")
+            st.caption(f"AI 분석 호출 (세션): {st.session_state.gemini_api_calls}")
 
         with col2:
             st.markdown("**가치평가 모델**")
-            default_roe = st.session_state.kiwoom_data.get('roe', 10.0)
-            est_roe = st.slider("예상 ROE (%)", 0.0, 50.0, default_roe, 0.1, help="'최신 정보 조회' 시점의 ROE가 기본값으로 설정됩니다.")
+            est_roe = st.slider("예상 ROE (%)", 0.0, 50.0, st.session_state.kiwoom_data.get('roe', 10.0), 0.1)
             cost_of_equity = st.slider("자기자본비용 (Ke, %)", 5.0, 15.0, 9.0, 0.1)
             terminal_growth = st.slider("영구성장률 (g, %)", 0.0, 5.0, 3.0, 0.1)
-
         with col3:
             st.markdown("**목표주가 변수**")
-            default_bps = st.session_state.kiwoom_data.get('bps', 150000)
-            est_bps = st.number_input("예상 BPS (원)", value=int(default_bps), help="'최신 정보 조회' 시점의 BPS가 기본값으로 설정됩니다.")
+            est_bps = st.number_input("예상 BPS (원)", value=int(st.session_state.kiwoom_data.get('bps', 150000)))
 
-    target_pbr = (est_roe - terminal_growth) / (cost_of_equity - terminal_growth) if (cost_of_equity - terminal_growth) != 0 else 0
-    calculated_target_price = target_pbr * est_bps
-
+    target_pbr = ValuationCalculator.calculate_target_pbr(est_roe, cost_of_equity, terminal_growth)
+    calculated_target_price = ValuationCalculator.calculate_target_price(target_pbr, est_bps)
+    current_price = st.session_state.kiwoom_data.get('price', 0)
+    investment_opinion, upside_potential = ValuationCalculator.get_investment_opinion(current_price, calculated_target_price)
     st.divider()
 
     st.header("1. 요약 (Executive Summary)")
-    current_price = st.session_state.kiwoom_data.get('price', 0)
-    upside_potential = ((calculated_target_price / current_price) - 1) * 100 if current_price > 0 else 0.0
-    
-    if upside_potential > 15: investment_opinion = "매수 (Buy)"
-    elif upside_potential > -5: investment_opinion = "중립 (Neutral)"
-    else: investment_opinion = "매도 (Sell)"
-    if current_price == 0: investment_opinion = "-"
-
     summary_cols = st.columns(4)
     summary_cols[0].metric("투자의견", investment_opinion)
     summary_cols[1].metric("현재주가", f"{current_price:,.0f} 원" if current_price else "N/A")
     summary_cols[2].metric("목표주가", f"{calculated_target_price:,.0f} 원")
     summary_cols[3].metric("상승여력", f"{upside_potential:.2f} %")
-
     st.info(f"**핵심 투자 요약:**\n\n> {st.session_state.investment_summary}")
     st.divider()
 
     main_col1, main_col2 = st.columns(2)
     with main_col1:
         st.subheader("2. 기업 개요")
-        kiwoom_data = st.session_state.kiwoom_data
-        market_cap = kiwoom_data.get('market_cap', 0)
-        market_cap_display = f"{market_cap / 100000000:,.0f} 억원" if market_cap > 0 else "N/A"
-        
+        market_cap = st.session_state.kiwoom_data.get('market_cap', 0)
         st.text_input("회사명", company_name, disabled=True)
         st.text_input("티커", stock_code, disabled=True)
         st.text_area("주요 사업", st.session_state.main_business, disabled=True)
-        st.text_input("시가총액", market_cap_display, disabled=True)
-        
+        st.text_input("시가총액", f"{market_cap / 100000000:,.0f} 억원" if market_cap > 0 else "N/A", disabled=True)
         overview_cols = st.columns(2)
-        overview_cols[0].metric("PER", f"{kiwoom_data.get('per', 0):.2f} 배")
-        overview_cols[1].metric("PBR", f"{kiwoom_data.get('pbr', 0):.2f} 배")
-        overview_cols[0].metric("52주 최고", f"{kiwoom_data.get('high_52w', 0):,.0f} 원")
-        overview_cols[1].metric("52주 최저", f"{kiwoom_data.get('low_52w', 0):,.0f} 원")
-
+        overview_cols[0].metric("PER", f"{st.session_state.kiwoom_data.get('per', 0):.2f} 배")
+        overview_cols[1].metric("PBR", f"{st.session_state.kiwoom_data.get('pbr', 0):.2f} 배")
+        overview_cols[0].metric("52주 최고", f"{st.session_state.kiwoom_data.get('high_52w', 0):,.0f} 원")
+        overview_cols[1].metric("52주 최저", f"{st.session_state.kiwoom_data.get('low_52w', 0):,.0f} 원")
     with main_col2:
         st.subheader("3. Gemini 종합 분석")
-        with st.container(border=True):
-            st.markdown(st.session_state.gemini_analysis)
-
+        with st.container(border=True): st.markdown(st.session_state.gemini_analysis)
     st.divider()
 
     st.header("4. 실적 전망 (Earnings Forecast)")
-    st.caption("아래 표의 데이터를 직접 수정하여 목표주가 계산에 실시간으로 반영할 수 있습니다. '최신 정보 조회' 시 2023A 데이터가 업데이트됩니다.")
-    edited_df = st.data_editor(st.session_state.df_forecast, use_container_width=True)
-    st.session_state.df_forecast = edited_df
-    
-    st.caption("> 2024년, 2025년 실적은 시장 컨센서스 또는 사용자 추정치를 바탕으로 합니다.")
+    st.caption("아래 표의 데이터를 직접 수정하여 목표주가 계산에 실시간으로 반영할 수 있습니다.")
+    st.session_state.df_forecast = st.data_editor(st.session_state.df_forecast, use_container_width=True)
     st.divider()
 
     st.header("5. 가치평가 (Valuation)")
-    st.write("본 리포트는 **PBR-ROE 모델**을 기반으로 목표주가를 산출했습니다.")
     val_col1, val_col2 = st.columns(2)
     with val_col1:
         st.markdown(f"- **(A) 예상 ROE:** `{est_roe:.2f} %`")
         st.markdown(f"- **(B) 자기자본비용 (Ke):** `{cost_of_equity:.2f} %`")
         st.markdown(f"- **(C) 영구성장률 (g):** `{terminal_growth:.2f} %`")
-    with val_col2:
-        st.success(f"**목표 PBR (배):** `{target_pbr:.2f}` 배")
-
+    with val_col2: st.success(f"**목표 PBR (배):** `{target_pbr:.2f}` 배")
     st.subheader("5.2. 목표주가 산출")
     val2_col1, val2_col2 = st.columns(2)
     with val2_col1:
         st.markdown(f"- **(D) 목표 PBR:** `{target_pbr:.2f}` 배")
         st.markdown(f"- **(E) 예상 BPS:** `{est_bps:,.0f}` 원")
-    with val2_col2:
-        st.success(f"**목표주가 (원):** `{calculated_target_price:,.0f}` 원")
-    st.divider()    
+    with val2_col2: st.success(f"**목표주가 (원):** `{calculated_target_price:,.0f}` 원")
+    st.divider()
 
     st.header("6. 주가 차트 (Stock Chart)")
-    if st.button("📊 일봉 차트 생성", help="키움 API를 통해 최신 일봉 차트와 투자자별 매매 동향을 조회합니다.", use_container_width=True):
-        display_stock_chart(stock_code)
-
+    if st.button("📊 캔들 차트 생성", help="키움 API를 통해 일봉, 주봉, 월봉 캔들 차트를 조회합니다.", use_container_width=True):
+        display_candlestick_chart(stock_code, company_name)
     st.divider()
     st.write("*본 보고서는 외부 출처로부터 얻은 정보에 기반하며, 정확성을 보장하지 않습니다. 투자 결정에 대한 최종 책임은 투자자 본인에게 있습니다.*")
 

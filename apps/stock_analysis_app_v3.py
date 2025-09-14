@@ -234,6 +234,85 @@ def plot_ownership_chart(ax, df, title):
     ax.legend()
     ax.grid(True, linestyle='--', alpha=0.6)
 
+
+def _fetch_kiwoom_chart_data(token, api_id, endpoint, params):
+    """Helper to fetch data for charts from a specific Kiwoom endpoint."""
+    url = f'{KIWOOM_BASE_URL}{endpoint}'
+    headers = {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'authorization': f'Bearer {token}',
+        'appkey': KIWOOM_APP_KEY,
+        'appsecret': KIWOOM_APP_SECRET,
+        'api-id': api_id,
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=params)
+        response.raise_for_status()
+        
+        response_data = response.json()
+
+        if response_data.get('return_code') != 0:
+            st.error(f"API 조회 실패 ({api_id}): {response_data.get('return_msg')}")
+            st.json(response_data)
+            return []
+
+        # Find the list of data in the response
+        for key, value in response_data.items():
+            if isinstance(value, list) and value:
+                return value
+        
+        st.warning(f"차트 데이터를 가져올 수 없습니다 ({api_id}). 응답에서 데이터 목록을 찾을 수 없습니다.")
+        return []
+    except requests.exceptions.RequestException as e:
+        st.error(f"Kiwoom API ({api_id}) 호출 중 오류 발생: {e}")
+        if e.response:
+            st.error(f"응답 내용: {e.response.text}")
+        return []
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        st.error(f"API 응답 데이터 처리 중 오류 발생 ({api_id}): {e}")
+        return []
+
+
+def _process_chart_dataframe(data_list):
+    """Helper to process raw chart data into a clean DataFrame."""
+    if not data_list:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data_list)
+
+    date_col = None
+    # Find date column from a list of possible names
+    for col_name in ['date', 'dt', 'stck_bsop_date', 'base_dt', 'stck_dt']:
+        if col_name in df.columns:
+            date_col = col_name
+            break
+    
+    if not date_col:
+        st.error("응답에서 날짜 정보를 찾을 수 없습니다.")
+        return pd.DataFrame()
+        
+    df['dt'] = pd.to_datetime(df[date_col])
+    df = df.set_index('dt').sort_index()
+
+    def clean_numeric_str(series):
+        series_str = series.astype(str)
+        cleaned_series = series_str.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
+        return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
+
+    # Standardize price column name ('cur_prc' or 'stck_clpr' -> 'close_pric')
+    price_cols = {'cur_prc': 'close_pric', 'stck_clpr': 'close_pric', 'clpr': 'close_pric'}
+    df.rename(columns=price_cols, inplace=True)
+
+    # Clean all relevant numeric columns if they exist
+    all_cols = ['close_pric', 'for_rt', 'for_netprps', 'orgn_netprps', 'ind_netprps']
+    for col in all_cols:
+        if col in df.columns:
+            df[col] = clean_numeric_str(df[col])
+
+    return df
+
+
 def display_stock_chart(stock_code):
     """키움 API를 사용하여 주가, 투자자별 매매동향, 외국인 보유율 종합 차트를 생성하고 Streamlit에 표시하는 함수"""
     token = get_kiwoom_token()
@@ -243,87 +322,54 @@ def display_stock_chart(stock_code):
 
     with st.spinner("종합 차트 데이터를 조회하고 생성 중입니다..."):
         try:
-            # 1. 단일 API 호출로 모든 데이터 조회
-            endpoint = '/api/dostk/mrkcond'
-            url = f'{KIWOOM_BASE_URL}{endpoint}'
-            headers = {
-                'Content-Type': 'application/json;charset=UTF-8',
-                'authorization': f'Bearer {token}',
-                'appkey': KIWOOM_APP_KEY,
-                'appsecret': KIWOOM_APP_SECRET,
-                'api-id': 'ka10086',
-            }
-            params = {
-                'stk_cd': stock_code,
-                'qry_dt': pd.Timestamp.now().strftime('%Y%m%d'),
-                'indc_tp': '1' # 금액(백만원)으로 조회
-            }
-            
-            response = requests.post(url, headers=headers, json=params)
-            response.raise_for_status()
-            
-            response_data = response.json()
-            if response_data.get('return_code') != 0:
-                st.error(f"API 조회 실패: {response_data.get('return_msg')}")
-                st.json(response_data)
-                return
-
-            daily_data = response_data.get('daly_stkpc', [])
-            if not daily_data:
-                st.warning("차트 데이터를 가져올 수 없습니다.")
-                return
-
-            # 2. 데이터프레임 생성 및 데이터 정제
-            df = pd.DataFrame(daily_data)
-            df['dt'] = pd.to_datetime(df['date'])
-            df = df.set_index('dt').sort_index()
-
-            def clean_numeric_str(series):
-                cleaned_series = series.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
-                return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
-
-            df['close_pric'] = clean_numeric_str(df['close_pric'])
-            df['for_rt'] = clean_numeric_str(df['for_rt'])
-            df['for_netprps'] = clean_numeric_str(df['for_netprps'])
-            df['orgn_netprps'] = clean_numeric_str(df['orgn_netprps'])
-            df['ind_netprps'] = clean_numeric_str(df['ind_netprps'])
-
-            # 3. 주간, 월간 데이터 리샘플링
-            agg_rules = {
-                'close_pric': 'last',
-                'for_netprps': 'sum',
-                'orgn_netprps': 'sum',
-                'ind_netprps': 'sum',
-                'for_rt': 'last'
-            }
-            df_weekly = df.resample('W').agg(agg_rules).dropna(subset=['close_pric'])
-            df_monthly = df.resample('M').agg(agg_rules).dropna(subset=['close_pric'])
-
-            # 4. 기간별로 데이터 필터링
             now = pd.Timestamp.now()
-            df_daily_filtered = df[df.index >= (now - pd.DateOffset(months=3))]
-            df_weekly_filtered = df_weekly[df_weekly.index >= (now - pd.DateOffset(months=6))]
-            df_monthly_filtered = df_monthly[df_monthly.index >= (now - pd.DateOffset(months=12))]
+            now_str = now.strftime('%Y%m%d')
 
-            # 5. 3x3 종합 차트 그리기
+            # 1. Fetch Daily Data (has investor info)
+            daily_params = {'stk_cd': stock_code, 'qry_dt': now_str, 'indc_tp': '1'}
+            daily_list = _fetch_kiwoom_chart_data(token, 'ka10086', '/api/dostk/mrkcond', daily_params)
+            df_daily = _process_chart_dataframe(daily_list)
+
+            # 2. Fetch Weekly Data (price only)
+            weekly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'W', 'upd_stkpc_tp': '1'}
+            weekly_list = _fetch_kiwoom_chart_data(token, 'ka10082', '/api/dostk/chart', weekly_params)
+            df_weekly = _process_chart_dataframe(weekly_list)
+
+            # 3. Fetch Monthly Data (price only)
+            monthly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'M', 'upd_stkpc_tp': '1'}
+            monthly_list = _fetch_kiwoom_chart_data(token, 'ka10083', '/api/dostk/chart', monthly_params)
+            df_monthly = _process_chart_dataframe(monthly_list)
+
+            # 4. Filter data for plotting
+            df_daily_filtered = df_daily[df_daily.index >= (now - pd.DateOffset(months=3))] if not df_daily.empty else pd.DataFrame()
+            df_weekly_filtered = df_weekly[df_weekly.index >= (now - pd.DateOffset(months=6))] if not df_weekly.empty else pd.DataFrame()
+            df_monthly_filtered = df_monthly[df_monthly.index >= (now - pd.DateOffset(months=12))] if not df_monthly.empty else pd.DataFrame()
+
+            if df_daily_filtered.empty and df_weekly_filtered.empty and df_monthly_filtered.empty:
+                st.warning("차트 데이터를 표시할 수 없습니다.")
+                return
+
+            # 5. Plotting
             st.header("종합 분석 차트")
-            fig, axes = plt.subplots(3, 3, figsize=(18, 15), constrained_layout=True)
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
             fig.suptitle(f'{stock_code} 종합 분석 차트', fontsize=20)
 
-            # --- Row 1: Price ---
-            plot_price_chart(axes[0, 0], df_daily_filtered, "일봉 (3개월)")
-            plot_price_chart(axes[0, 1], df_weekly_filtered, "주봉 (6개월)")
-            plot_price_chart(axes[0, 2], df_monthly_filtered, "월봉 (12개월)")
+            # --- Row 1: Price Charts ---
+            if not df_daily_filtered.empty: plot_price_chart(axes[0, 0], df_daily_filtered, "일봉 (3개월)")
+            if not df_weekly_filtered.empty: plot_price_chart(axes[0, 1], df_weekly_filtered, "주봉 (6개월)")
+            if not df_monthly_filtered.empty: plot_price_chart(axes[0, 2], df_monthly_filtered, "월봉 (12개월)")
 
-            # --- Row 2: Net Buy ---
-            plot_net_buy_chart(axes[1, 0], df_daily_filtered, "일간 (3개월)")
-            plot_net_buy_chart(axes[1, 1], df_weekly_filtered, "주간 (6개월)")
-            plot_net_buy_chart(axes[1, 2], df_monthly_filtered, "월간 (12개월)")
+            # --- Row 2: Daily Investor Info ---
+            net_buy_cols = ['for_netprps', 'orgn_netprps', 'ind_netprps']
+            if not df_daily_filtered.empty and all(c in df_daily_filtered.columns for c in net_buy_cols):
+                plot_net_buy_chart(axes[1, 0], df_daily_filtered, "일간 투자자별 순매수 (3개월)")
+            
+            ownership_col = 'for_rt'
+            if not df_daily_filtered.empty and ownership_col in df_daily_filtered.columns:
+                plot_ownership_chart(axes[1, 1], df_daily_filtered, "일간 외국인 지분율 (3개월)")
 
-            # --- Row 3: Ownership ---
-            plot_ownership_chart(axes[2, 0], df_daily_filtered, "일간 (3개월)")
-            plot_ownership_chart(axes[2, 1], df_weekly_filtered, "주간 (6개월)")
-            plot_ownership_chart(axes[2, 2], df_monthly_filtered, "월간 (12개월)")
+            # Turn off the unused subplot
+            axes[1, 2].axis('off')
 
             st.pyplot(fig)
 

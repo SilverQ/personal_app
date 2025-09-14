@@ -203,11 +203,17 @@ class KiwoomAPIHandler:
             response_data = response.json()
 
             if response_data.get('return_code') != 0:
+                st.error(f"API Error for {api_id}: {response_data.get('return_msg')}")
                 return []
 
             for key, value in response_data.items():
                 if isinstance(value, list) and value:
                     return value
+            
+            # Handle non-list successful response by wrapping it in a list
+            if response_data.get('return_code') == 0:
+                return [response_data]
+
             return []
         except requests.exceptions.RequestException:
             return []
@@ -223,7 +229,7 @@ class KiwoomAPIHandler:
         date_col_map = {'stck_bsop_date': 'dt', 'date': 'dt', 'base_dt': 'dt', 'stck_dt': 'dt'}
         df.rename(columns=date_col_map, inplace=True)
         if 'dt' not in df.columns:
-            st.error(f"API 응답에서 날짜 컬럼을 찾을 수 없습니다. 사용 가능한 컬럼: {df.columns.tolist()}")
+            # If no date column, cannot proceed with time series analysis
             return pd.DataFrame()
         df['dt'] = pd.to_datetime(df['dt'])
         df = df.set_index('dt').sort_index()
@@ -238,11 +244,11 @@ class KiwoomAPIHandler:
             'high': ['stck_hgpr', 'high_pric'],
             'low': ['stck_lwpr', 'low_pric'],
             'close': ['stck_clpr', 'cur_prc', 'clpr', 'stck_prpr', 'close_pric'],
-            'volume': ['acml_vol', 'trde_qty'],
+            'volume': ['acml_vol', 'trde_qty', 'acc_trde_qty'],
             'for_rt': ['for_rt'],
-            'for_netprps': ['for_netprps'],
-            'orgn_netprps': ['orgn_netprps'],
-            'ind_netprps': ['ind_netprps']
+            'for_netprps': ['for_netprps', 'frgnr_invsr'],
+            'orgn_netprps': ['orgn_netprps', 'orgn'],
+            'ind_netprps': ['ind_netprps', 'ind_invsr']
         }
 
         for standard_name, possible_names in column_map.items():
@@ -284,6 +290,19 @@ class KiwoomAPIHandler:
         now_str = now.strftime('%Y%m%d')
         params = {'stk_cd': stock_code, 'qry_dt': now_str, 'indc_tp': '1'}
         data_list = self._fetch_chart_data(token, 'ka10086', '/api/dostk/mrkcond', params)
+        return self._process_chart_dataframe(data_list)
+
+    def fetch_investor_data(self, stock_code):
+        """Fetches investor-specific trading data."""
+        token = self.get_token()
+        if not token:
+            return pd.DataFrame()
+        
+        now = pd.Timestamp.now()
+        now_str = now.strftime('%Y%m%d')
+        
+        params = {'stk_cd': stock_code, 'dt': now_str, 'amt_qty_tp': '1', 'trde_tp': '0', 'unit_tp': '1000'}
+        data_list = self._fetch_chart_data(token, 'ka10059', '/api/dostk/stkinfo', params)
         return self._process_chart_dataframe(data_list)
 
 class ValuationCalculator:
@@ -348,13 +367,12 @@ def display_candlestick_chart(stock_code, company_name):
         st.error("차트를 생성하려면 Kiwoom 핸들러가 필요합니다.")
         return
 
-    with st.spinner("캔들 차트 데이터를 조회하고 생성 중입니다..."):
-        # 주말만 제외하도록 rangebreaks 설정
-        rangebreaks = [dict(bounds=["sat", "mon"])]
-
+    with st.spinner("주가 및 투자자 동향 데이터를 조회하고 차트를 생성 중입니다..."):
+        rangebreaks = [dict(bounds=["sat", "mon"]) # 주말 제외
+        ]
         df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
 
-        # --- Daily Chart (Fallback to Line Chart) ---
+        # --- Daily Chart with Investor Data ---
         df_daily_filtered = df_daily[df_daily.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
         has_ohlc = not df_daily_filtered.empty and all(col in df_daily_filtered.columns for col in ['open', 'high', 'low', 'close'])
 
@@ -367,25 +385,46 @@ def display_candlestick_chart(stock_code, company_name):
             daily_title = f'{company_name} 일봉 (3개월)'
             fig = None
             if has_ohlc:
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=(daily_title, '거래량'), row_heights=[0.7, 0.3])
+                # --- Fetch investor data ---
+                df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+                
+                # --- Create subplots (add row for investor data) ---
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
+                                    subplot_titles=(daily_title, '거래량', '투자자별 매매동향 (순매수, 백만원)'), 
+                                    row_heights=[0.5, 0.2, 0.3])
+
+                # Candlestick Trace
                 fig.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
+                
+                # Volume Trace
                 if 'volume' in df_daily_filtered.columns:
                     colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
                     fig.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
-            else:
+
+                # Investor Traces
+                if not df_investor.empty and all(c in df_investor.columns for c in ['ind_netprps', 'for_netprps', 'orgn_netprps']):
+                    df_investor_filtered = df_investor[df_investor.index.isin(df_daily_filtered.index)] # Align dates
+                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['ind_netprps'], name='개인'), row=3, col=1)
+                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['for_netprps'], name='외국인'), row=3, col=1)
+                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['orgn_netprps'], name='기관'), row=3, col=1)
+                    fig.update_layout(barmode='group', yaxis3_title_text='순매수 금액')
+                else:
+                    st.warning("투자자별 매매동향 데이터를 차트에 표시할 수 없습니다. API 응답을 확인하세요.")
+
+            else: # Fallback line chart
                 fig = make_subplots(rows=1, cols=1, subplot_titles=(daily_title,))
                 if 'close' in df_daily_filtered.columns:
                     fig.add_trace(go.Scatter(x=df_daily_filtered.index, y=df_daily_filtered['close'], mode='lines', name='종가'))
                 else:
                     st.error(f"일봉 대체 데이터에 'close' 컬럼이 없습니다. 사용 가능한 컬럼: {df_daily_filtered.columns.tolist()}")
-                    fig = None # 차트 생성 중단
+                    fig = None
             
             if fig:
                 fig.update_xaxes(rangebreaks=rangebreaks)
-                fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
+                fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=700, margin=dict(l=10, r=10, b=10, t=40))
                 st.plotly_chart(fig, use_container_width=True)
 
-        # --- Weekly & Monthly Charts (Candlestick only) ---
+        # --- Weekly & Monthly Charts (Unchanged) ---
         chart_data = {
             '주봉 (1년)': df_weekly[df_weekly.index >= (pd.Timestamp.now() - pd.DateOffset(years=1))],
             '월봉 (3년)': df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))]
@@ -569,7 +608,7 @@ def main():
     st.divider()
 
     st.header("6. 주가 차트 (Stock Chart)")
-    if st.button("📊 캔들 차트 생성", help="키움 API를 통해 일봉, 주봉, 월봉 캔들 차트를 조회합니다.", use_container_width=True):
+    if st.button("📊 주가 & 투자자 동향 차트 생성", help="키움 API를 통해 일봉, 주봉, 월봉 및 투자자별 동향 차트를 조회합니다.", use_container_width=True):
         display_candlestick_chart(stock_code, company_name)
     st.divider()
     st.write("*본 보고서는 외부 출처로부터 얻은 정보에 기반하며, 정확성을 보장하지 않습니다. 투자 결정에 대한 최종 책임은 투자자 본인에게 있습니다.*")

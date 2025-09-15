@@ -1,1409 +1,617 @@
-"""
-stock_analysis_app_v2 (리팩터링 + 진단 로그 강화)
-- 메인 앱의 사이드바를 사용하지 않는 서브앱 버전
-- 상단 컨트롤 패널(본문 영역)에서 1회 입력 → 단일 종합 보고서 렌더
-- ReportBuilder 클래스로 수집/검증/시각화/내보내기 일원화
-- DART 기반 재무/밸류에이션(옵션), PyKrx 기반 가격/수급
-- PDF(ReportLab+Kaleido) 또는 HTML 자동 내보내기
-- 🔧 어디서 실패했는지 알 수 있도록 단계별 진단 로그 출력
-
-주의: set_page_config는 메인에서만 호출합니다.
-"""
-
-from __future__ import annotations
-
 import streamlit as st
+import pandas as pd
+from google import genai
+import os
+import configparser
+import re
+import requests
+import json
+import time
+import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-from pathlib import Path
-import time
-import pickle
-import configparser
-import warnings
-import traceback
-import math
-from datetime import timezone, datetime
-import pandas as pd
-import re
-import os
-import inspect
+from plotly.subplots import make_subplots
 
-warnings.filterwarnings("ignore")
+# --- Constants and Paths ---
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(APP_DIR)
 
-# =============================
-# 환경 설정/외부 라이브러리 체크
-# =============================
-IS_DEBUG = False
+# --- Object-Oriented Handlers ---
 
-CONFIG = configparser.ConfigParser()
-CONFIG.read("config.ini")
-DART_KEY = CONFIG.get("DART", "key", fallback=None)
+class ConfigManager:
+    """Manages application configuration from config.ini."""
+    def __init__(self, root_dir):
+        self.config_path = os.path.join(root_dir, 'config.ini')
+        self.config = configparser.ConfigParser()
+        self.config.read(self.config_path)
 
-try:
-    from pykrx import stock
-    from pykrx.stock import get_market_ticker_name
-    PYKRX_AVAILABLE = True
-except Exception as _e:
-    PYKRX_AVAILABLE = False
+    def get_gemini_key(self):
+        """Retrieves the Gemini API key."""
+        gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not gemini_api_key:
+            try:
+                gemini_api_key = self.config.get('GEMINI_API_KEY', 'key', fallback=None)
+            except (configparser.NoSectionError, configparser.NoOptionError):
+                gemini_api_key = None
+        return gemini_api_key
 
-# OpenDartReader는 배포 버전에 따라 생성자 접근 방식이 다릅니다.
-# - 어떤 환경: from OpenDartReader import OpenDartReader; OpenDartReader(api_key)
-# - 다른 환경: import OpenDartReader; OpenDartReader.OpenDartReader(api_key)
-try:
-    import OpenDartReader as _odr_module  # 모듈로 임포트 시도
-    if hasattr(_odr_module, "OpenDartReader"):
-        ODR_CTOR = _odr_module.OpenDartReader
-    else:
-        ODR_CTOR = _odr_module  # type: ignore
-    DART_AVAILABLE = True
-except Exception:
-    try:
-        from OpenDartReader import OpenDartReader as _odr_class  # type: ignore
-        ODR_CTOR = _odr_class
-        DART_AVAILABLE = True
-    except Exception:
-        DART_AVAILABLE = False
-        ODR_CTOR = None
-
-try:
-    # PDF 생성(선택): ReportLab
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas as pdf_canvas
-    from reportlab.lib.units import cm
-    REPORTLAB_AVAILABLE = True
-except Exception:
-    REPORTLAB_AVAILABLE = False
-
-try:
-    # Plotly 정적 이미지 저장(선택)
-    import kaleido  # ← 실제 엔진
-    KALEIDO_AVAILABLE = True
-except Exception:
-    KALEIDO_AVAILABLE = False
-
-import plotly.io as pio
-
-# =============================
-# 캐시/헬퍼
-# =============================
-CACHE_DIR = Path("./cache"); CACHE_DIR.mkdir(exist_ok=True)
-SIMPLE_CACHE = Path("simple_trading_cache.pkl")
-
-
-def _now_kst():
-    # pytz 없이도 동작하도록 간단 변환
-    return datetime.utcnow() + timedelta(hours=9)
-
-
-def _load_simple_cache() -> dict:
-    if SIMPLE_CACHE.exists():
+    def get_kiwoom_config(self):
+        """Retrieves Kiwoom API configuration."""
         try:
-            return pickle.load(open(SIMPLE_CACHE, "rb"))
-        except Exception:
-            return {}
-    return {}
+            app_key = self.config.get('KIWOOM_API', 'appkey')
+            app_secret = self.config.get('KIWOOM_API', 'secretkey')
+            mode = self.config.get('KIWOOM_API', 'mode', fallback='mock')
+            base_url = "https://api.kiwoom.com" if mode == 'real' else "https://mockapi.kiwoom.com"
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            st.warning("Kiwoom API 키를 찾을 수 없어 시세 조회가 제한됩니다. config.ini 파일을 확인해주세요.")
+            return None, None, 'mock', 'https://mockapi.kiwoom.com'
+        return app_key, app_secret, mode, base_url
 
-
-def _save_simple_cache(data: dict) -> None:
-    try:
-        pickle.dump(data, open(SIMPLE_CACHE, "wb"))
-    except Exception:
-        pass
-
-
-def _ticker_name(ticker: str) -> str:
-    if not PYKRX_AVAILABLE:
-        return ticker
-    try:
-        name = get_market_ticker_name(ticker)
-        return name or ticker
-    except Exception:
-        return ticker
-
-
-def _ohlcv(ticker: str, start: str, end: str, adjusted: bool=False) -> pd.DataFrame:
-    if not PYKRX_AVAILABLE:
-        return pd.DataFrame()
-    return stock.get_market_ohlcv_by_date(start, end, ticker, adjusted=adjusted)
-
-
-
-def _investor_daily(ticker: str, start: str, end: str, debug=None) -> pd.DataFrame:
-    """영업일 기준 일자 index, 컬럼은 투자자 구분(개인/기관합계/외국인/기타법인) 순매수만 반환.
-    debug: callable(event: str, message: str, **context)
-    """
-    if not PYKRX_AVAILABLE:
-        if debug: debug("pykrx_missing", "PyKrx 미설치로 투자자 데이터 수집 불가")
-        return pd.DataFrame()
-    key = f"INV_{ticker}_{start}_{end}"
-    cache = _load_simple_cache()
-    if key in cache:
-        if debug: debug("cache_hit", "투자자 데이터 캐시 적중", key=key)
-        return cache[key]
-    dates = pd.bdate_range(pd.to_datetime(start), pd.to_datetime(end))
-    out = []
-    for d in dates:
-        ds = d.strftime("%Y%m%d")
-        try:
-            df = stock.get_market_trading_value_by_investor(ds, ds, ticker)
-            if df is not None and not df.empty:
-                if "순매수" in df.columns:
-                    day = df["순매수"].to_frame().T
-                    day.index = [pd.to_datetime(ds)]
-                    out.append(day)
-                else:
-                    if debug: debug("no_column", "'순매수' 컬럼 없음", date=ds, cols=list(df.columns))
-            else:
-                if debug: debug("empty", "해당 일자 데이터 없음", date=ds)
-        except Exception as ex:
-            if debug: debug("error", "일자 데이터 수집 실패", date=ds, error=str(ex), tb=traceback.format_exc())
-        time.sleep(0.2)
-    if not out:
-        if debug: debug("result_empty", "누적 결과가 비어 있습니다.")
-        return pd.DataFrame()
-    res = pd.concat(out).fillna(0)
-    cache[key] = res
-    _save_simple_cache(cache)
-    if debug: debug("cache_save", "투자자 데이터 캐시에 저장", rows=len(res))
-    return res
-
-
-def _current_close(ticker: str) -> float | None:
-    if not PYKRX_AVAILABLE:
-        return None
-    try:
-        today = datetime.now().strftime("%Y%m%d")
-        yday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-        df = stock.get_market_ohlcv_by_date(yday, today, ticker)
-        if df is not None and not df.empty:
-            return float(df["종가"].iloc[-1])
-    except Exception:
-        return None
-    return None
-
-
-def _latest_prices(ticker: str, log=None):
-    if not PYKRX_AVAILABLE:
-        if log: log("warning", "PRICE_NOW", "PyKrx 미설치")
-        return None
-
-    now = _now_kst()
-    start = (now - timedelta(days=20)).strftime("%Y%m%d")
-    end   = now.strftime("%Y%m%d")
-
-    try:
-        df = stock.get_market_ohlcv_by_date(start, end, ticker)
-        if df is None or df.empty:
-            if log: log("warning", "PRICE_NOW", "OHLCV empty", start=start, end=end)
-            return None
-        df = df.sort_index()
-
-        last_idx = df.index[-1]
-        last     = df.iloc[-1]
-
-        # KRX 일일데이터 확정 시간을 넉넉히 18:00(KST)로 설정
-        cutoff = now.replace(hour=18, minute=0, second=0, microsecond=0)
-
-        if now < cutoff and len(df) >= 2:
-            settled_idx = df.index[-2]
-            settled     = df.iloc[-2]
+class GeminiAPIHandler:
+    """Handles interactions with the Gemini API."""
+    def __init__(self, api_key):
+        self.client = None
+        if api_key:
+            try:
+                self.client = genai.Client(api_key=api_key)
+            except Exception as e:
+                st.error(f"Gemini API 클라이언트 초기화 중 오류가 발생했습니다: {e}")
         else:
-            settled_idx = last_idx
-            settled     = last
+            st.warning("Gemini API 키를 찾을 수 없어 AI 분석 기능이 제한됩니다. 환경 변수 또는 config.ini 파일을 확인해주세요.")
 
-        out = {
-            "latest_date":  last_idx.strftime("%Y-%m-%d"),
-            "latest_open":  float(last.get("시가", np.nan))  if "시가" in last else np.nan,
-            "latest_high":  float(last.get("고가", np.nan))  if "고가" in last else np.nan,
-            "latest_low":   float(last.get("저가", np.nan))  if "저가" in last else np.nan,
-            "latest_close": float(last.get("종가", np.nan))  if "종가" in last else np.nan,
-            "latest_volume":float(last.get("거래량", np.nan)) if "거래량" in last else np.nan,
+    def generate_content(self, prompt, system_instruction):
+        """Generates content using the Gemini API."""
+        if self.client is None:
+            return "오류: Gemini 클라이언트가 초기화되지 않았습니다."
+        try:
+            combined_prompt = f"{system_instruction}\n\n{prompt}"
+            response = self.client.models.generate_content(model='models/gemini-1.5-flash', contents=combined_prompt)
+            return response.text
+        except Exception as e:
+            st.error("Gemini API 호출 중 오류가 발생했습니다.")
+            st.exception(e)
+            return "오류로 인해 분석 내용을 생성할 수 없습니다."
 
-            "settled_date":  settled_idx.strftime("%Y-%m-%d"),
-            "settled_close": float(settled.get("종가", np.nan)) if "종가" in settled else np.nan,
+class KiwoomAPIHandler:
+    """Handles interactions with the Kiwoom REST API."""
+    def __init__(self, app_key, app_secret, base_url):
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.base_url = base_url
+
+    def get_token(self):
+        """Fetches and caches the Kiwoom API token."""
+        if not self.app_key or not self.app_secret:
+            st.error("키움 API 키가 설정되지 않았습니다. config.ini 파일을 확인하세요.")
+            return None
+
+        if 'kiwoom_token' in st.session_state and st.session_state.kiwoom_token_expires_at > time.time():
+            return st.session_state.kiwoom_token
+
+        url = f"{self.base_url}/oauth2/token"
+        headers = {"Content-Type": "application/json"}
+        data = {
+            "grant_type": "client_credentials",
+            "appkey": self.app_key,
+            "secretkey": self.app_secret
         }
-        if log:
-            log("info", "PRICE_NOW",
-                "가장 최근(잠정) & 확정 종가 산출",
-                latest_date=out["latest_date"], latest_close=out["latest_close"],
-                settled_date=out["settled_date"], settled_close=out["settled_close"])
-        return out
-    except Exception as ex:
-        if log: log("error", "PRICE_NOW", "조회 예외", error=str(ex), tb=traceback.format_exc())
-        return None
-
-# =============================
-# DART 수집 & 모델 (견고화)
-# =============================
-class DartDataCollector:
-    def __init__(self, api_key: str | None, log=None):
-        self.api_key = api_key
-        self._log = log
-        self.dart = None
-        self._finstate_supports_fs_div: bool | None = None  # ← 추가: 지원여부 캐시
-
-        if api_key and DART_AVAILABLE and ODR_CTOR is not None:
-            try:
-                self.dart = ODR_CTOR(api_key)
-                if self._log: self._log("info", "DART_INIT", "OpenDartReader 초기화 성공")
-            except Exception as ex:
-                if self._log: self._log("error", "DART_INIT", "OpenDartReader 초기화 실패",
-                                         error=str(ex), tb=traceback.format_exc())
-        else:
-            if self._log: self._log("warning", "DART_INIT", "DART 사용 불가 (키 없음/미설치)")
-
-    # ---------------------------
-    # 내부 유틸
-    # ---------------------------
-    def _logx(self, level, stage, msg, **ctx):
-        if callable(self._log):
-            self._log(level, stage, msg, **ctx)
-
-    def _corp_codes_df(self):
-        """버전별 corp_codes 접근(속성/함수 모두 처리)"""
+        response = None
         try:
-            cc = getattr(self.dart, "corp_codes", None)
-            if cc is None:
+            response = requests.post(url, headers=headers, data=json.dumps(data))
+            response.raise_for_status()
+            token_data = response.json()
+
+            if 'token' not in token_data and 'access_token' in token_data:
+                token_data['token'] = token_data['access_token']
+
+            if 'token' not in token_data:
+                st.error("키움 API 토큰 발급 실패: 응답에 'token' 또는 'access_token'이 없습니다.")
+                st.json(token_data)
                 return None
-            # 속성인가?
-            if isinstance(cc, (pd.DataFrame, list)):
-                return pd.DataFrame(cc)
-            # 함수인가?
-            if callable(cc):
-                df = cc()
-                return pd.DataFrame(df)
-        except Exception as ex:
-            self._logx("warning", "DART_COMPANY", "corp_codes 접근 실패", error=str(ex))
-        return None
 
-    def _normalize_fs(self, df: pd.DataFrame, year: int, rc: str):
-        if df is None or df.empty:
-            return df
-        out = df.copy()
-        for c in ["fs_div", "sj_div", "account_id", "account_nm",
-                  "thstrm_amount", "thstrm_add_amount", "frmtrm_amount", "bfefrmtrm_amount"]:
-            if c in out.columns:
-                out[c] = out[c].astype(str)
-        out["__bsns_year"] = int(year)
-        out["__reprt_code"] = str(rc)
-        return out
+            st.session_state.kiwoom_token = token_data['token']
 
-    def _call_finstate(self, corp_code: str, y: int, rc: str, retry=2, wait=0.2):
-        last_err = None
-        for k in range(retry + 1):
-            try:
-                fs = self.dart.finstate(str(corp_code), int(y), reprt_code=str(rc), fs_div="CFS")
-                if fs is not None and not getattr(fs, "empty", False):
-                    return self._normalize_fs(fs, y, rc)
-                else:
-                    self._logx("debug", "DART_FS", "빈 재무제표", year=y, reprt_code=rc)
-            except Exception as ex:
-                last_err = ex
-                self._logx("warning", "DART_FS", "재무제표 조회 실패(재시도 예정)",
-                           year=y, reprt_code=rc, attempt=k, error=str(ex))
-            time.sleep(wait * (k + 1))  # 점증 백오프
-        if last_err:
-            self._logx("error", "DART_FS", "재무제표 조회 최종 실패",
-                       year=y, reprt_code=rc, error=str(last_err), tb=traceback.format_exc())
-        return None
-
-    # ---------------------------
-    # 회사 식별
-    # ---------------------------
-    def company(self, ticker: str) -> dict | None:
-        """DART 회사 기본 정보 조회 (강화된 폴백 순서).
-        1) dart.company(티커)  → dict
-        2) corp_codes DF에서 stock_code 일치 행
-        3) find_corp_code(티커)
-        4) 종목명 → company_by_name(종목명)
-        """
-        if not self.dart:
-            self._logx("warning", "DART_COMPANY", "DART 핸들 없음")
-            return None
-
-        t = str(ticker)
-
-        # 1) company(ticker)
-        try:
-            info = self.dart.company(t)
-            if isinstance(info, dict):
-                cc = info.get("corp_code") or info.get("corpcode")
-                nm = info.get("corp_name") or info.get("corpname")
-                if cc:
-                    self._logx("info", "DART_COMPANY", "company() 성공", corp_code=cc, corp_name=nm)
-                    return {"corp_code": str(cc), "corp_name": str(nm or t), "stock_code": t}
-        except Exception as ex:
-            self._logx("warning", "DART_COMPANY", "company() 실패", error=str(ex))
-
-        # 2) corp_codes DF 탐색
-        try:
-            cdf = self._corp_codes_df()
-            if isinstance(cdf, pd.DataFrame) and not cdf.empty:
-                # 컬럼 이름 버전차 가드
-                cols = {c.lower(): c for c in cdf.columns}
-                sc = cols.get("stock_code") or cols.get("stockcode") or "stock_code"
-                cc = cols.get("corp_code") or cols.get("corpcode") or "corp_code"
-                cn = cols.get("corp_name") or cols.get("corpname") or "corp_name"
-                if sc in cdf.columns and cc in cdf.columns:
-                    row = cdf[cdf[sc].astype(str) == t]
-                    if not row.empty:
-                        r0 = row.iloc[0]
-                        corp_code = str(r0.get(cc))
-                        corp_name = str(r0.get(cn, t))
-                        self._logx("info", "DART_COMPANY", "corp_codes 매칭", corp_code=corp_code, corp_name=corp_name)
-                        return {"corp_code": corp_code, "corp_name": corp_name, "stock_code": t}
-                else:
-                    self._logx("debug", "DART_COMPANY", "corp_codes DF에 필요한 컬럼 없음",
-                               columns=list(cdf.columns))
-            else:
-                self._logx("warning", "DART_COMPANY", "corp_codes 비어있음 또는 미지원")
-        except Exception as ex:
-            self._logx("warning", "DART_COMPANY", "corp_codes 탐색 실패", error=str(ex))
-
-        # 3) find_corp_code
-        try:
-            cc = self.dart.find_corp_code(t)
-            if cc:
+            if 'expires_dt' in token_data:
                 try:
-                    nm = get_market_ticker_name(t)
-                except Exception:
-                    nm = t
-                self._logx("info", "DART_COMPANY", "find_corp_code() 성공", corp_code=cc, corp_name=nm)
-                return {"corp_code": str(cc), "corp_name": str(nm), "stock_code": t}
-        except Exception as ex:
-            self._logx("warning", "DART_COMPANY", "find_corp_code() 실패", error=str(ex))
+                    expires_ts = pd.to_datetime(token_data['expires_dt'], format='%Y%m%d%H%M%S').timestamp()
+                    st.session_state.kiwoom_token_expires_at = expires_ts - 60
+                except ValueError:
+                    st.session_state.kiwoom_token_expires_at = time.time() + 3600 - 60
+            else:
+                expires_in = int(token_data.get('expires_in', 3600))
+                st.session_state.kiwoom_token_expires_at = time.time() + expires_in - 60
 
-        # 4) 종목명으로 조회
-        try:
-            nm = get_market_ticker_name(t)
-            byname = self.dart.company_by_name(str(nm))
-            if hasattr(byname, "empty") and not byname.empty:
-                row = byname.iloc[0]
-                corp_code = row.get("corp_code") or row.get("corpcode")
-                corp_name = row.get("corp_name") or row.get("corpname") or nm
-                if corp_code:
-                    self._logx("info", "DART_COMPANY", "company_by_name() 성공",
-                               corp_code=corp_code, corp_name=corp_name)
-                    return {"corp_code": str(corp_code), "corp_name": str(corp_name), "stock_code": t}
-        except Exception as ex:
-            self._logx("warning", "DART_COMPANY", "company_by_name() 실패", error=str(ex))
+            return st.session_state.kiwoom_token
+        except requests.exceptions.RequestException as e:
+            st.error(f"키움 API 토큰 발급 중 오류 발생: {e}")
+            if e.response:
+                st.error(f"응답 내용: {e.response.text}")
+            return None
+        except json.JSONDecodeError:
+            st.error(f"키움 API 토큰 응답이 JSON 형식이 아닙니다. 응답: {response.text if response else 'N/A'}")
+            return None
 
-        self._logx("warning", "DART_COMPANY", "모든 매칭 실패", ticker=t)
-        return None
-
-    # ---------------------------
-    # 재무제표 수집
-    # ---------------------------
-    def fin_map(self, corp_code: str, years: int = 5) -> dict[int, pd.DataFrame]:
-        if not self.dart:
-            self._logx("warning", "DART_FS", "DART 핸들 없음")
+    def get_stock_info(self, stock_code):
+        """Fetches detailed stock information."""
+        token = self.get_token()
+        if not token:
             return {}
-        out: dict[int, pd.DataFrame] = {}
-        this_year = datetime.now().year
-        reprt_codes = ["11011", "11012", "11013", "11014"]  # 사업→반기→1Q→3Q
 
-        for y in range(this_year - years, this_year):
-            got = False
-            for rc in reprt_codes:
-                fs = self._call_finstate(corp_code, y, rc, retry=2, wait=0.25)
-                if fs is not None and not fs.empty:
-                    out[y] = fs
-                    self._logx("info", "DART_FS", "재무제표 수집", year=y, reprt_code=rc, rows=len(fs))
-                    got = True
+        url = f"{self.base_url}/api/dostk/stkinfo"
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "api-id": "ka10001"
+        }
+        params = {"stk_cd": stock_code}
+
+        try:
+            response = requests.post(url, headers=headers, json=params)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get('return_code') != 0:
+                st.error(f"키움 API 오류: {data.get('return_msg', '상세 메시지 없음')}")
+                st.json(data)
+                return {}
+
+            def clean_value(value_str):
+                if isinstance(value_str, str) and value_str:
+                    try:
+                        return float(value_str.replace('+', '').replace('-', ''))
+                    except ValueError:
+                        return 0.0
+                elif isinstance(value_str, (int, float)):
+                    return float(value_str)
+                return 0.0
+
+            info = {
+                'price': clean_value(data.get('cur_prc', 0)),
+                'market_cap': int(clean_value(data.get('mac', 0)) * 100000000),
+                'per': clean_value(data.get('per', 0)),
+                'pbr': clean_value(data.get('pbr', 0)),
+                'eps': clean_value(data.get('eps', 0)),
+                'bps': clean_value(data.get('bps', 0)),
+                'roe': clean_value(data.get('roe', 0)),
+                'high_52w': clean_value(data.get('250hgst', 0)),
+                'low_52w': clean_value(data.get('250lwst', 0)),
+            }
+            return info
+        except requests.exceptions.RequestException as e:
+            st.error(f"키움 API (stkinfo) 호출 중 오류 발생: {e}")
+            if e.response:
+                st.error(f"응답 내용: {e.response.text}")
+            return {}
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            st.error(f"API 응답 데이터 처리 중 오류 발생: {e}")
+            return {}
+
+    def _fetch_chart_data(self, token, api_id, endpoint, params):
+        url = f'{self.base_url}{endpoint}'
+        headers = {
+            'Content-Type': 'application/json;charset=UTF-8',
+            'authorization': f'Bearer {token}',
+            'appkey': self.app_key,
+            'appsecret': self.app_secret,
+            'api-id': api_id,
+        }
+        try:
+            response = requests.post(url, headers=headers, json=params)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('return_code') != 0:
+                st.error(f"API Error for {api_id}: {response_data.get('return_msg')}")
+                return []
+
+            for key, value in response_data.items():
+                if isinstance(value, list) and value:
+                    return value
+            
+            # Handle non-list successful response by wrapping it in a list
+            if response_data.get('return_code') == 0:
+                return [response_data]
+
+            return []
+        except requests.exceptions.RequestException:
+            return []
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return []
+
+    def _process_chart_dataframe(self, data_list):
+        if not data_list:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data_list)
+
+        date_col_map = {'stck_bsop_date': 'dt', 'date': 'dt', 'base_dt': 'dt', 'stck_dt': 'dt'}
+        df.rename(columns=date_col_map, inplace=True)
+        if 'dt' not in df.columns:
+            # If no date column, cannot proceed with time series analysis
+            return pd.DataFrame()
+        df['dt'] = pd.to_datetime(df['dt'])
+        df = df.set_index('dt').sort_index()
+
+        def clean_and_convert_to_numeric(series):
+            series_str = series.astype(str)
+            cleaned_series = series_str.str.replace('[+,]', '', regex=True).str.replace('--', '-', regex=False)
+            return pd.to_numeric(cleaned_series, errors='coerce').fillna(0)
+
+        column_map = {
+            'open': ['stck_oprc', 'open_pric'],
+            'high': ['stck_hgpr', 'high_pric'],
+            'low': ['stck_lwpr', 'low_pric'],
+            'close': ['stck_clpr', 'cur_prc', 'clpr', 'stck_prpr', 'close_pric'],
+            'volume': ['acml_vol', 'trde_qty', 'acc_trde_qty'],
+            'for_rt': ['for_rt'],
+            'for_netprps': ['for_netprps', 'frgnr_invsr'],
+            'orgn_netprps': ['orgn_netprps', 'orgn'],
+            'ind_netprps': ['ind_netprps', 'ind_invsr']
+        }
+
+        for standard_name, possible_names in column_map.items():
+            for name in possible_names:
+                if name in df.columns:
+                    df[standard_name] = clean_and_convert_to_numeric(df[name])
                     break
-            if not got:
-                self._logx("warning", "DART_FS", "해당 연도 보고서 미확보", year=y)
-
-        if not out:
-            self._logx("warning", "DART_FS", "수집된 재무제표가 없습니다.")
-        else:
-            y0 = sorted(out.keys())[0]
-            try:
-                self._logx("debug", "DART_FS_SAMPLE", "예시 로우",
-                           sample=out[y0].head(3).to_dict(orient="records"))
-            except Exception:
-                pass
-        return out
-
-    def _detect_fs_div_support(self):
-        """첫 호출 전에 한 번만 시그니처를 보고 추정. (완벽하지 않으면 런타임 예외로 재확정)"""
-        try:
-            sig = inspect.signature(self.dart.finstate)
-            self._finstate_supports_fs_div = "fs_div" in sig.parameters
-            self._logx("debug", "DART_FS", f"fs_div 지원 탐지: {self._finstate_supports_fs_div}")
-        except Exception:
-            # 알 수 없으면 None → 실제 호출에서 예외를 보고 결정
-            self._finstate_supports_fs_div = None
-
-    def _call_finstate(self, corp_code: str, y: int, rc: str, retry=2, wait=0.25):
-        if self._finstate_supports_fs_div is None:
-            self._detect_fs_div_support()
-
-        last_err = None
-        for k in range(retry + 1):
-            try:
-                if self._finstate_supports_fs_div:
-                    fs = self.dart.finstate(str(corp_code), int(y), reprt_code=str(rc), fs_div="CFS")
-                else:
-                    fs = self.dart.finstate(str(corp_code), int(y), reprt_code=str(rc))
-                if fs is not None and not getattr(fs, "empty", False):
-                    return self._normalize_fs(fs, y, rc)
-                else:
-                    self._logx("debug", "DART_FS", "빈 재무제표", year=y, reprt_code=rc)
-            except TypeError as ex:
-                # "unexpected keyword argument 'fs_div'" → 지원 안 함으로 전환하고 즉시 재시도
-                msg = str(ex)
-                if "fs_div" in msg:
-                    if self._finstate_supports_fs_div is not False:
-                        self._logx("warning", "DART_FS",
-                                   "설치된 OpenDartReader는 fs_div 미지원 → 폴백(인자 제거)로 전환")
-                    self._finstate_supports_fs_div = False
-                    last_err = ex
-                else:
-                    last_err = ex
-                    self._logx("warning", "DART_FS", "TypeError", year=y, reprt_code=rc,
-                               attempt=k, error=msg)
-            except Exception as ex:
-                last_err = ex
-                self._logx("warning", "DART_FS", "재무제표 조회 실패(재시도 예정)",
-                           year=y, reprt_code=rc, attempt=k, error=str(ex))
-            time.sleep(wait * (k + 1))
-
-        if last_err:
-            self._logx("error", "DART_FS", "재무제표 조회 최종 실패",
-                       year=y, reprt_code=rc, error=str(last_err),
-                       tb=traceback.format_exc())
-        return None
-
-    def company(self, ticker: str) -> dict | None:
-        # (이 부분은 기존 강화 버전 그대로 사용하셔도 됩니다)
-        t = str(ticker)
-        if not self.dart:
-            self._logx("warning", "DART_COMPANY", "DART 핸들 없음")
-            return None
-        try:
-            info = self.dart.company(t)
-            if isinstance(info, dict):
-                cc = info.get("corp_code") or info.get("corpcode")
-                nm = info.get("corp_name") or info.get("corpname")
-                if cc:
-                    self._logx("info", "DART_COMPANY", "company() 성공", corp_code=cc, corp_name=nm)
-                    return {"corp_code": str(cc), "corp_name": str(nm or t), "stock_code": t}
-        except Exception as ex:
-            self._logx("warning", "DART_COMPANY", "company() 실패", error=str(ex))
-
-        # corp_codes → find_corp_code → company_by_name 순 폴백 (생략)
-        # ... (사용 중인 버전 그대로 두세요)
-
-        self._logx("warning", "DART_COMPANY", "모든 매칭 실패", ticker=t)
-        return None
-
-
-# --- DCFModel 보강: FCFF 구성요소 추출 ---
-# ==== 교체: DCFModel 전체 ====
-class DCFModel:
-    def __init__(self):
-        # 기본 가정(필요시 UI로 노출해 조정 가능)
-        self.rfr = 0.035   # 무위험수익률
-        self.mrp = 0.06    # 시장위험프리미엄
-        self.crp = 0.005   # 국가위험프리미엄
-        self.tax = 0.25    # 법인세율
-        self.g   = 0.025   # 말기성장률
-
-    def wacc(self, beta: float, debt_ratio: float = 0.3) -> float:
-        coe = self.rfr + beta * (self.mrp + self.crp)   # 주주요구수익률
-        cod = self.rfr + 0.02                           # 부채비용(단순 가정)
-        return (1 - debt_ratio) * coe + debt_ratio * cod * (1 - self.tax)
-
-    @staticmethod
-    def _parse_amount(v):
-        """DART 금액(문자/숫자)을 억원(float)으로 파싱"""
-        import numpy as np, re
-        if v is None:
-            return None
-        if isinstance(v, (int, float)) and not (isinstance(v, float) and np.isnan(v)):
-            return float(v) / 1e8
-        s = str(v).strip()
-        if s in ("", "-", "nan", "None"):
-            return None
-        if s.startswith("(") and s.endswith(")"):
-            s = "-" + s[1:-1]
-        s = s.replace(",", "")
-        m = re.match(r"^-?\d+(\.\d+)?$", s)
-        if not m:
-            digits = re.sub(r"[^0-9\.\-]", "", s)
-            if digits in ("", "-", "."):
-                return None
-            s = digits
-        try:
-            return float(s) / 1e8
-        except Exception:
-            return None
-
-    @staticmethod
-    def _prefer_cfs(df: pd.DataFrame) -> pd.DataFrame:
-        """가능하면 연결재무제표(CFS) 우선"""
-        if df is None or df.empty:
-            return df
-        if "fs_div" in df.columns:
-            cfs = df[df["fs_div"].astype(str).str.upper() == "CFS"]
-            if not cfs.empty:
-                return cfs
+        
         return df
 
-    def _pick_row(self, df: pd.DataFrame, names=(), ids=()):
-        """IFRS account_id 정확 일치 우선, 없으면 account_nm 부분일치"""
-        if df is None or df.empty:
-            return None
-        d = self._prefer_cfs(df)
+    def fetch_all_chart_data(self, stock_code):
+        token = self.get_token()
+        if not token:
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-        # 1) account_id 정확 일치
-        if ids and "account_id" in d.columns:
-            target = set(i.lower() for i in ids)
-            mask = d["account_id"].astype(str).str.lower().isin(target)
-            cand = d[mask]
-            if not cand.empty:
-                return cand.iloc[0]
+        now = pd.Timestamp.now()
+        now_str = now.strftime('%Y%m%d')
 
-        # 2) account_nm 부분일치
-        if names and "account_nm" in d.columns:
-            m = pd.Series(False, index=d.index)
-            for n in names:
-                m = m | d["account_nm"].astype(str).str.contains(n, na=False)
-            cand = d[m]
-            if not cand.empty:
-                return cand.iloc[0]
-        return None
+        daily_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'D', 'upd_stkpc_tp': '1'}
+        daily_list = self._fetch_chart_data(token, 'ka10081', '/api/dostk/chart', daily_params)
+        df_daily = self._process_chart_dataframe(daily_list)
 
-    def _amount_from_row(self, row: pd.Series) -> float:
-        """여러 컬럼(thstrm_amount 등)에서 금액 추출 → 억원"""
-        for col in ["thstrm_amount", "thstrm_add_amount", "frmtrm_amount", "bfefrmtrm_amount"]:
-            if isinstance(row, pd.Series) and (col in row.index):
-                v = self._parse_amount(row[col])
-                if v is not None:
-                    return float(v)
-        return 0.0
+        weekly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'W', 'upd_stkpc_tp': '1'}
+        weekly_list = self._fetch_chart_data(token, 'ka10082', '/api/dostk/chart', weekly_params)
+        df_weekly = self._process_chart_dataframe(weekly_list)
 
-    def extract_metrics(self, fs_map: dict[int, pd.DataFrame], log=None) -> dict[int, dict]:
-        m = {}
-        for y, fs in fs_map.items():
-            try:
-                def pick(df, sj):
-                    if df is None or df.empty:
-                        return df
-                    if "sj_div" in df.columns:
-                        return df[df["sj_div"] == sj]
-                    return df
+        monthly_params = {'stk_cd': stock_code, 'base_dt': now_str, 'period_cls': 'M', 'upd_stkpc_tp': '1'}
+        monthly_list = self._fetch_chart_data(token, 'ka10083', '/api/dostk/chart', monthly_params)
+        df_monthly = self._process_chart_dataframe(monthly_list)
 
-                is_df = pick(fs, "IS")
-                bs_df = pick(fs, "BS")
-                cf_df = pick(fs, "CF")
+        return df_daily, df_weekly, df_monthly
 
-                # IFRS id 우선 + 한글명 폴백 (몇 가지 변형 id도 포함)
-                rev_row   = self._pick_row(is_df, names=["매출", "수익"],
-                                           ids=["ifrs-full_Revenue", "ifrs_Revenue", "Revenue"])
-                ebit_row  = self._pick_row(is_df, names=["영업이익"],
-                                           ids=["ifrs-full_OperatingIncomeLoss", "OperatingIncomeLoss"])
-                net_row   = self._pick_row(is_df, names=["당기순이익", "분기순이익", "지배기업 소유주지분 순이익"],
-                                           ids=["ifrs-full_ProfitLoss",
-                                                "ifrs-full_ProfitLossAttributableToOwnersOfParent",
-                                                "ProfitLoss"])
-                assets_row = self._pick_row(bs_df, names=["자산총계"],
-                                            ids=["ifrs-full_Assets", "Assets"])
-                equity_row = self._pick_row(bs_df, names=["자본총계", "지배기업 소유주지분"],
-                                            ids=["ifrs-full_Equity",
-                                                 "ifrs-full_EquityAttributableToOwnersOfParent",
-                                                 "Equity"])
-                ocf_row = self._pick_row(
-                    cf_df,
-                    names=["영업활동현금흐름", "영업활동 현금흐름", "영업활동으로 인한 현금흐름", "영업활동으로부터의 현금흐름", "영업활동현금흐름(간접법)"],
-                    ids=[
-                        "ifrs-full_CashFlowsFromUsedInOperatingActivities",
-                        "ifrs_CashFlowsFromUsedInOperatingActivities",
-                        "ifrs-full_CashFlowsFromUsedInOperatingActivitiesIndirectMethod",
-                    ],
-                )
+    def fetch_daily_fallback_data(self, stock_code):
+        """Fetches daily data (closing price) as a fallback for line charts."""
+        token = self.get_token()
+        if not token:
+            return pd.DataFrame()
+        now = pd.Timestamp.now()
+        now_str = now.strftime('%Y%m%d')
+        params = {'stk_cd': stock_code, 'qry_dt': now_str, 'indc_tp': '1'}
+        data_list = self._fetch_chart_data(token, 'ka10086', '/api/dostk/mrkcond', params)
+        return self._process_chart_dataframe(data_list)
 
-                vals = {
-                    "revenue":       self._amount_from_row(rev_row)    if rev_row   is not None else 0.0,
-                    "ebit":          self._amount_from_row(ebit_row)   if ebit_row  is not None else 0.0,
-                    "net_income":    self._amount_from_row(net_row)    if net_row   is not None else 0.0,
-                    "total_assets":  self._amount_from_row(assets_row) if assets_row is not None else 0.0,
-                    "total_equity":  self._amount_from_row(equity_row) if equity_row is not None else 0.0,
-                    "operating_cf":  self._amount_from_row(ocf_row)    if ocf_row   is not None else 0.0,
-                }
-                m[y] = vals
+    def fetch_investor_data(self, stock_code):
+        """Fetches investor-specific trading data."""
+        token = self.get_token()
+        if not token:
+            return pd.DataFrame()
+        
+        now = pd.Timestamp.now()
+        now_str = now.strftime('%Y%m%d')
+        
+        params = {'stk_cd': stock_code, 'dt': now_str, 'amt_qty_tp': '1', 'trde_tp': '0', 'unit_tp': '1000'}
+        data_list = self._fetch_chart_data(token, 'ka10059', '/api/dostk/stkinfo', params)
+        return self._process_chart_dataframe(data_list)
 
-                if log:
-                    def _lr(tag, row):
-                        if row is None:
-                            log("warning", "METRIC_MATCH", f"{tag} 미발견", year=y)
-                        else:
-                            log("debug", "METRIC_MATCH", f"{tag} 매칭",
-                                year=y,
-                                account_id=str(row.get("account_id", "")),
-                                account_nm=str(row.get("account_nm", "")),
-                                thstrm=str(row.get("thstrm_amount", "")))
-                    _lr("revenue", rev_row); _lr("ebit", ebit_row); _lr("net_income", net_row)
-                    _lr("assets", assets_row); _lr("equity", equity_row); _lr("operating_cf", ocf_row)
-
-            except Exception as ex:
-                if log:
-                    log("error", "METRICS", "지표 추출 실패", year=y, error=str(ex))
-        return m
-
-    def value(
-        self,
-        metrics: dict[int, dict],
-        beta: float = 1.0,
-        years: int = 5,
-        window=None,
-        *,
-        # ▶ 새로 추가된 선택 인자들 (넘겨와도 무시 가능)
-        shares_out: float | None = None,      # 발행주식수(주)
-        price_now: float | None = None,       # 현재가(원)
-        net_debt: float | None = None,        # 순차입금(억원) 있으면 주면 좋음
-        log=None,
-        **_                                         # 앞으로 추가될 인자도 안전 흡수
-    ) -> dict | None:
-        if len(metrics) < 3:
-            return None
-        if window is None:
-            window = min(years, len(metrics))
-        ys = sorted(metrics.keys())
-        latest = ys[-1]
-
-        # 성장률 g
-        revs = [metrics[y]["revenue"] for y in ys[-window:]]
-        g_list = []
-        for i in range(1, len(revs)):
-            if revs[i-1] > 0 and revs[i] > 0:
-                g_list.append(revs[i]/revs[i-1] - 1)
-        g = float(np.mean(g_list)) if g_list else 0.05
-        g = max(-0.1, min(0.3, g))
-
-        # 영업이익률 margin
-        m_list = []
-        for y in ys[-window:]:
-            rev = metrics[y]["revenue"]
-            if rev > 0:
-                m_list.append(metrics[y]["ebit"]/rev)
-        margin = float(np.mean(m_list)) if m_list else 0.1
-        margin = max(0.0, min(0.5, margin))
-
-        w = self.wacc(beta)
-        base = metrics[latest]["revenue"]
-        if base <= 0:
-            return None
-
-        rows = []
-        for t in range(1, years + 1):
-            rev = base * ((1 + g) ** t)
-            ebit = rev * margin
-            nopat = ebit * (1 - self.tax)
-            fcf = nopat * 0.8
-            pv = fcf / ((1 + w) ** t)
-            rows.append({"year": t, "revenue": rev, "ebit": ebit, "fcf": fcf, "pv_fcf": pv})
-
-        terminal_fcf = rows[-1]["fcf"] * (1 + self.g)
-        tv = terminal_fcf / (w - self.g)
-        pv_tv = tv / ((1 + w) ** years)
-        ev = sum(r["pv_fcf"] for r in rows) + pv_tv  # 기업가치(억원)
-
-        # 선택: 순차입금/주식수 있으면 자본가치/주당가도 계산
-        equity_value = None
-        intrinsic_per_share = None
-        if net_debt is not None:
-            equity_value = ev - net_debt
-        if equity_value is not None and shares_out and shares_out > 0:
-            intrinsic_per_share = (equity_value * 1e8) / shares_out  # 억원→원
-
-        if callable(log):
-            log("debug", "DCF_VALUE", "calc done",
-                wacc=f"{w:.4f}", g=f"{g:.4f}", margin=f"{margin:.4f}",
-                ev_억원=f"{ev:,.0f}",
-                equity_억원=None if equity_value is None else f"{equity_value:,.0f}",
-                per_share=None if intrinsic_per_share is None else f"{intrinsic_per_share:,.0f}",
-                shares_out=shares_out, net_debt=net_debt, price_now=price_now)
-
-        return {
-            "enterprise_value": ev,
-            "equity_value": equity_value,
-            "intrinsic_per_share": intrinsic_per_share,
-            "fcf_rows": rows,
-            "terminal_value": tv,
-            "wacc": w,
-            "growth": g,
-            "margin": margin,
-            "assumptions": {
-                "years": years,
-                "terminal_growth": self.g,
-                "tax": self.tax,
-                "beta": beta,
-                "shares_out": shares_out,
-                "price_now": price_now,
-                "net_debt": net_debt,
-            },
-        }
-
-
-# --- SRIMModel 보강: BPS·지속구간 반영 ---
-class SRIMModel:
-    def __init__(self):
-        self.rfr = 0.035
-        self.mrp = 0.06
-        self.crp = 0.005
-
-    def roe_parts(self, metrics: dict[int, dict]) -> dict[int, dict]:
-        out = {}
-        for y, m in metrics.items():
-            if m["total_equity"] > 0 and m["revenue"] > 0 and m["total_assets"] > 0:
-                nm = m["net_income"] / m["revenue"]
-                at = m["revenue"] / m["total_assets"]
-                em = m["total_assets"] / m["total_equity"]
-                out[y] = {"roe": nm*at*em, "net_margin": nm, "asset_turnover": at, "equity_multiplier": em}
-        return out
-
-    def value(
-        self,
-        metrics: dict[int, dict],
-        parts: dict[int, dict],
-        beta: float = 1.0,
-        window=3,
-        *,
-        bps_now: float | None = None,   # ▶ 새 인자
-        payout: float = 0.3,
-        log=None,
-        **_
-    ) -> dict | None:
-        if len(parts) < 2:
-            return None
-
-        rr = self.rfr + beta * (self.mrp + self.crp)
-        window = min(window, len(parts))
-        recent = [parts[y]["roe"] for y in sorted(parts.keys())[-window:]]
-        s_roe = float(np.mean(recent)) if recent else 0.1
-        s_roe = max(0.0, min(0.5, s_roe))
-
-        retain = 1 - payout
-        g = s_roe * retain
-
-        # 현재 BPS가 들어오면 사용, 없으면 단순치(개선 여지)
-        current_bps = bps_now if (bps_now and bps_now > 0) else 50000.0
-
-        if s_roe <= rr:
-            iv = current_bps
-            excess = 0.0
-        else:
-            excess = s_roe - rr
-            if rr <= g:
-                iv = current_bps * 2
-            else:
-                iv = current_bps + (excess * current_bps) / (rr - g)
-
-        if callable(log):
-            log("debug", "SRIM_VALUE", "calc done",
-                s_roe=f"{s_roe:.4f}", rr=f"{rr:.4f}", g=f"{g:.4f}",
-                payout=f"{payout:.2f}", bps_now=current_bps, iv=f"{iv:,.0f}")
-
-        return {
-            "intrinsic_value": iv,
-            "sustainable_roe": s_roe,
-            "required_return": rr,
-            "growth_rate": g,
-            "excess_roe": excess,
-            "current_bps": current_bps,
-            "roe_components": parts,
-        }
-
-
-# =============================
-# ReportBuilder (+ 진단 로그)
-# =============================
-class ReportBuilder:
-    def __init__(self, ticker: str, days: int, beta: float, years: int, use_dart: bool):
-        self.ticker = ticker.strip()
-        self.days = int(days)
-        self.beta = float(beta)
-        self.years = int(years)
-        self.use_dart = use_dart and bool(DART_KEY)
-        self.errors: list[str] = []
-        self.warnings: list[str] = []
-        self.logs: list[dict] = []  # 🔧 진단 로그
-        self.company: dict | None = None
-        self.metrics: dict | None = None
-        self.dcf: dict | None = None
-        self.srim: dict | None = None
-        self.price_df: pd.DataFrame | None = None
-        self.inv_df: pd.DataFrame | None = None
-        self.ticker_name: str = _ticker_name(self.ticker)
-        self.current_price: float | None = None
-        self._price_info: dict | None = None  # 최근일 잠정/확정가 모두 보관
-        self.fig_price = None
-        self.fig_flow = None
-        self.fig_flow_cum = None
-
-    # ---------- 로깅 유틸 ----------
-    def _log(self, level: str, stage: str, msg: str, **ctx):
-        safe_ctx = {str(k): str(v) for k, v in (ctx or {}).items()}
-        self.logs.append({
-            "ts": datetime.now().strftime("%H:%M:%S"),
-            "level": level.upper(),
-            "stage": stage,
-            "message": msg,
-            "context": safe_ctx,
-        })
-
-    def _dbg_fn(self, stage: str):
-        def _fn(event: str, message: str, **ctx):
-            self._log("debug", stage, f"{event}: {message}", **ctx)
-        return _fn
-
-    # ---------- 내부: 최신/확정 종가 산출(폴백) ----------
+class ValuationCalculator:
     @staticmethod
-    def _calc_latest_prices(ticker: str):
-        """pykrx 일자 3일치로 '잠정 최신 종가'와 '확정 종가'를 구분해 반환
-        - latest_close/latest_date: 조회 구간의 마지막 영업일 종가
-        - settled_close/settled_date: 마지막 전일(=데이터가 하루 더 쌓여 확정) 종가
-        """
-        if not PYKRX_AVAILABLE:
-            return None
-        try:
-            end = datetime.now()
-            start = end - timedelta(days=7)
-            s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-            df = stock.get_market_ohlcv_by_date(s, e, ticker)
-            if df is None or df.empty:
-                return None
-            df = df.sort_index()
-            dates = list(df.index)
-            if not dates:
-                return None
-            latest_date = dates[-1]
-            latest_close = float(df.loc[latest_date, "종가"])
-            # 확정 종가: 직전 영업일(데이터가 하루 더 들어와 '잠정 오차'가 해소된 값으로 간주)
-            settled_date = dates[-2] if len(dates) >= 2 else dates[-1]
-            settled_close = float(df.loc[settled_date, "종가"])
-            return {
-                "latest_date": latest_date.strftime("%Y-%m-%d"),
-                "latest_close": latest_close,
-                "settled_date": settled_date.strftime("%Y-%m-%d"),
-                "settled_close": settled_close,
-            }
-        except Exception:
-            return None
+    def calculate_target_pbr(roe, cost_of_equity, terminal_growth):
+        roe_pct, ke_pct, g_pct = roe / 100, cost_of_equity / 100, terminal_growth / 100
+        return (roe_pct - g_pct) / (ke_pct - g_pct) if (ke_pct - g_pct) != 0 else 0
 
-    # ---------- 검증 ----------
-    def validate(self) -> bool:
-        self._log("info", "VALIDATE", "입력 검증 시작", ticker=self.ticker, days=self.days, beta=self.beta, years=self.years, use_dart=self.use_dart)
-        if len(self.ticker) != 6 or not self.ticker.isdigit():
-            self.errors.append("종목 코드는 6자리 숫자여야 합니다 (예: 005930).")
-            self._log("error", "VALIDATE", "종목 코드 형식 오류")
-        if self.days <= 0 or self.days > 365 * 2:
-            self.errors.append("분석 기간은 1~730일 사이로 입력해주세요.")
-            self._log("error", "VALIDATE", "기간 범위 오류", days=self.days)
-        if not PYKRX_AVAILABLE:
-            self.errors.append("PyKrx가 필요합니다. 'pip install pykrx'")
-            self._log("error", "ENV", "PyKrx 미설치")
-        if self.use_dart and not DART_AVAILABLE:
-            self.warnings.append("OpenDartReader 미설치: 밸류에이션이 제한될 수 있습니다.")
-            self._log("warning", "ENV", "OpenDartReader 미설치")
-        if not self.use_dart:
-            self.warnings.append("DART 비활성화: 재무/밸류에이션 섹션이 축약됩니다.")
-            self._log("info", "ENV", "DART 비활성화")
-        ok = len(self.errors) == 0
-        self._log("info", "VALIDATE", "입력 검증 종료", ok=ok)
-        return ok
+    @staticmethod
+    def calculate_target_price(target_pbr, bps):
+        return target_pbr * bps
 
-    # ---------- 수집 ----------
-    def collect(self):
-        self._log("info", "COLLECT", "수집 시작")
-        end = datetime.now() - timedelta(days=1)
-        start = end - timedelta(days=self.days)
-        s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    @staticmethod
+    def get_investment_opinion(current_price, target_price):
+        if current_price <= 0 or target_price <= 0:
+            return "-", 0.0
+        upside = ((target_price / current_price) - 1) * 100
+        if upside > 15: return "매수 (Buy)", upside
+        if upside > -5: return "중립 (Neutral)", upside
+        return "매도 (Sell)", upside
 
-        # OHLCV
-        try:
-            self.price_df = _ohlcv(self.ticker, s, e)
-            n = 0 if self.price_df is None else len(self.price_df)
-            if self.price_df is None or self.price_df.empty:
-                self._log("warning", "OHLCV", "가격 데이터 없음", start=s, end=e)
-            else:
-                self._log("info", "OHLCV", "가격 데이터 수집", rows=n, cols=list(self.price_df.columns))
-        except Exception as ex:
-            self._log("error", "OHLCV", "가격 데이터 수집 실패", error=str(ex), tb=traceback.format_exc())
+# --- Wrapper Functions ---
 
-        # 투자자별
-        try:
-            self.inv_df = _investor_daily(self.ticker, s, e, debug=self._dbg_fn("INVESTOR"))
-            n = 0 if self.inv_df is None else len(self.inv_df)
-            if self.inv_df is None or self.inv_df.empty:
-                self._log("warning", "INVESTOR", "투자자별 데이터 없음", start=s, end=e)
-            else:
-                self._log("info", "INVESTOR", "투자자별 데이터 수집", rows=n, cols=list(self.inv_df.columns))
-        except Exception as ex:
-            self._log("error", "INVESTOR", "투자자별 데이터 수집 실패", error=str(ex), tb=traceback.format_exc())
+def get_kiwoom_token():
+    if 'kiwoom_handler' not in st.session_state: return None
+    return st.session_state.kiwoom_handler.get_token()
 
-        # 현재가(잠정/확정 구분)
-        try:
-            price_info = None
-            try:
-                # 외부 헬퍼가 있으면 우선 사용
-                price_info = _latest_prices(self.ticker, log=self._log)  # type: ignore[name-defined]
-            except Exception:
-                # 없으면 내부 폴백
-                price_info = self._calc_latest_prices(self.ticker)
+def get_kiwoom_stock_info(stock_code):
+    if 'kiwoom_handler' not in st.session_state: return {}
+    return st.session_state.kiwoom_handler.get_stock_info(stock_code)
 
-            if price_info:
-                self._price_info = price_info
-                # 보고서 KPI는 '확정 종가' 사용
-                self.current_price = price_info.get("settled_close")
-                self._log("info", "PRICE_NOW", "현재가 조회",
-                          settled=price_info.get("settled_close"),
-                          settled_date=price_info.get("settled_date"),
-                          latest=price_info.get("latest_close"),
-                          latest_date=price_info.get("latest_date"))
-            else:
-                self._log("warning", "PRICE_NOW", "가격 정보 산출 실패")
-        except Exception as ex:
-            self._log("error", "PRICE_NOW", "현재가 조회 예외", error=str(ex), tb=traceback.format_exc())
+def generate_gemini_content(prompt, system_instruction):
+    if 'gemini_handler' not in st.session_state: return "오류: Gemini 핸들러가 초기화되지 않았습니다."
+    return st.session_state.gemini_handler.generate_content(prompt, system_instruction)
 
-        # DART → 재무/밸류에이션
-        if self.use_dart and DART_KEY:
-            dart = DartDataCollector(DART_KEY, log=self._log)
-            self.company = dart.company(self.ticker)  # 표시용
-            corp = (self.company or {}).get("corp_code")
-            if corp:
-                fs_map = dart.fin_map(corp, years=self.years)
-                try:
-                    dcf_model = DCFModel()
+# --- UI and Data Functions ---
 
-                    # 재무 지표 추출(감가/Capex/NWC/이자비용/이자성부채까지)
-                    self.metrics = dcf_model.extract_metrics(fs_map, log=self._log)
-                    if not self.metrics:
-                        self._log("warning", "METRICS", "재무 지표 추출 결과 없음")
-                    else:
-                        # 합계 로그(파싱 성공 여부 가늠)
-                        sum_keys = ["revenue", "ebit", "net_income", "total_assets", "total_equity",
-                                    "operating_cf", "da", "capex", "nwc", "interest_expense", "ib_debt"]
-                        sums = {k: float(sum((v.get(k, 0.0) or 0.0) for v in self.metrics.values())) for k in sum_keys}
-                        self._log("info", "METRICS_SUM", "지표 합계(억원 / 일부항목은 억원기준)", **sums)
-                        if sums.get("revenue", 0.0) == 0.0:
-                            self._log("error", "METRICS_ZERO", "매출액 합계가 0 → 계정 매핑/단위 파싱 재검토 필요")
+@st.cache_data(ttl=86400)
+def get_stock_list():
+    try:
+        df = pd.read_csv(os.path.join(APP_DIR, 'stock_list.csv'), dtype={'code': str, 'name': str})
+        if 'name' not in df.columns or 'code' not in df.columns: return pd.DataFrame()
+        return df
+    except Exception: return pd.DataFrame()
 
-                    # ---- 연동 포인트: 주식수/시가총액/BPS ----
-                    shares_out = None
-                    try:
-                        # 만주 → 주
-                        shares_out = get_share_count(self.ticker) * 10000  # type: ignore[name-defined]
-                    except Exception:
-                        shares_out = None
+def get_empty_forecast_df():
+    data = {'(단위: 십억원)': ['매출액', '영업이익', '순이익', 'EPS (원)', 'BPS (원)', 'ROE (%)'],
+            '2023A': [0.0]*6, '2024E': [0.0]*6, '2025E': [0.0]*6}
+    return pd.DataFrame(data).set_index('(단위: 십억원)').astype(float)
 
-                    price_now = self.current_price or None
-                    bps_now = None
-                    if self.metrics and shares_out:
-                        latest_y = max(self.metrics.keys())
-                        eq_억원 = self.metrics[latest_y].get("total_equity", 0.0) or 0.0
-                        if eq_억원 > 0:
-                            bps_now = (eq_억원 * 1e8) / float(shares_out)  # 원/주
+def reset_states_on_stock_change():
+    st.session_state.gemini_analysis = "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요."
+    st.session_state.main_business = "-"
+    st.session_state.investment_summary = "-"
+    st.session_state.kiwoom_data = {}
+    st.session_state.df_forecast = get_empty_forecast_df()
 
-                    # ---- DCF 계산(시장가중/실효 CoD 반영) ----
-                    self.dcf = dcf_model.value(
-                        self.metrics or {}, beta=self.beta, years=self.years, window=min(self.years, 5),
-                        shares_out=shares_out, price_now=price_now, log=self._log
-                    )
-                    self._log("info", "ASSUMPTIONS", "DCF 파라미터", years=self.years, window=min(self.years, 5))
-                    if self.dcf is None:
-                        self._log("warning", "DCF", "DCF 계산 실패 또는 데이터 부족")
-                    else:
-                        self._log("info", "DCF", "DCF 계산 완료", EV_억원=round(self.dcf["enterprise_value"], 0))
+# --- Plotting Functions ---
 
-                    # ---- S-RIM 계산(BPS/지속계수 반영) ----
-                    sr = SRIMModel()
-                    parts = sr.roe_parts(self.metrics or {})
-                    if not parts:
-                        self._log("warning", "SRIM", "ROE 분해 결과 없음")
-                    sr_window = min(self.years, max(2, len(parts))) if parts else 2
-                    self.srim = sr.value(
-                        self.metrics or {}, parts, beta=self.beta, window=sr_window,
-                        bps_now=bps_now, persistence=0.6, log=self._log
-                    )
-                    self._log("info", "ASSUMPTIONS", "SRIM 파라미터", window=sr_window, bps_now=bps_now)
-                    if self.srim is None:
-                        self._log("warning", "SRIM", "S-RIM 계산 실패 또는 데이터 부족")
-                    else:
-                        self._log("info", "SRIM", "S-RIM 계산 완료", IV=self.srim.get("intrinsic_value"))
-                except Exception as ex:
-                    self._log("error", "VALUATION", "밸류에이션 계산 중 예외", error=str(ex), tb=traceback.format_exc())
-            else:
-                self._log("warning", "DART", "corp_code 미확보 → DART 재무 수집 생략")
-        else:
-            self._log("info", "DART", "DART 비사용 경로")
+def display_candlestick_chart(stock_code, company_name):
+    if 'kiwoom_handler' not in st.session_state:
+        st.error("차트를 생성하려면 Kiwoom 핸들러가 필요합니다.")
+        return
 
-        self._log("info", "COLLECT", "수집 종료")
+    with st.spinner("주가 및 투자자 동향 데이터를 조회하고 차트를 생성 중입니다..."):
+        rangebreaks = [dict(bounds=["sat", "mon"]) # 주말 제외
+        ]
+        df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
 
-    # ---------- 차트 ----------
-    def build_charts(self):
-        try:
-            if self.price_df is not None and not self.price_df.empty:
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(
-                    x=self.price_df.index,
-                    open=self.price_df.get("시가"),
-                    high=self.price_df.get("고가"),
-                    low=self.price_df.get("저가"),
-                    close=self.price_df.get("종가"),
-                    name="주가",
-                ))
-                fig.update_layout(title=f"{self.ticker_name} ({self.ticker}) 주가", height=420)
-                self.fig_price = fig
-                self._log("info", "CHART", "가격 차트 생성")
-            else:
-                self._log("warning", "CHART", "가격 데이터 없음으로 차트 생략")
-        except Exception as ex:
-            self._log("error", "CHART", "가격 차트 생성 실패", error=str(ex), tb=traceback.format_exc())
+        # --- Daily Chart with Investor Data ---
+        df_daily_filtered = df_daily[df_daily.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
+        has_ohlc = not df_daily_filtered.empty and all(col in df_daily_filtered.columns for col in ['open', 'high', 'low', 'close'])
 
-        try:
-            if self.inv_df is not None and not self.inv_df.empty:
-                valid = [c for c in ["개인", "기관합계", "외국인", "기타법인"] if c in self.inv_df.columns]
-                if valid:
-                    fig1 = go.Figure()
-                    for c in valid:
-                        fig1.add_trace(go.Scatter(x=self.inv_df.index, y=self.inv_df[c], mode="lines+markers", name=c))
-                    fig1.update_layout(title="투자자별 순매수 추이", height=360, hovermode="x unified")
-                    self.fig_flow = fig1
+        if not has_ohlc:
+            st.warning("API에서 일봉 OHLC 데이터를 제공하지 않아, 종가 기준 꺾은선 차트를 표시합니다.")
+            df_daily_fallback = st.session_state.kiwoom_handler.fetch_daily_fallback_data(stock_code)
+            df_daily_filtered = df_daily_fallback[df_daily_fallback.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
 
-                    cum = self.inv_df[valid].fillna(0).cumsum()
-                    fig2 = go.Figure()
-                    for c in valid:
-                        fig2.add_trace(go.Scatter(x=cum.index, y=cum[c], mode="lines", name=c))
-                    fig2.update_layout(title="투자자별 누적 순매수", height=360, hovermode="x unified")
-                    self.fig_flow_cum = fig2
-                    self._log("info", "CHART", "수급 차트 생성", cols=valid)
+        if not df_daily_filtered.empty:
+            daily_title = f'{company_name} 일봉 (3개월)'
+            fig = None
+            if has_ohlc:
+                # --- Fetch investor data ---
+                df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+                
+                # --- Create subplots (add row for investor data) ---
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
+                                    subplot_titles=(daily_title, '거래량', '투자자별 매매동향 (순매수, 백만원)'), 
+                                    row_heights=[0.5, 0.2, 0.3])
+
+                # Candlestick Trace
+                fig.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
+                
+                # Volume Trace
+                if 'volume' in df_daily_filtered.columns:
+                    colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
+                    fig.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
+
+                # Investor Traces
+                if not df_investor.empty and all(c in df_investor.columns for c in ['ind_netprps', 'for_netprps', 'orgn_netprps']):
+                    df_investor_filtered = df_investor[df_investor.index.isin(df_daily_filtered.index)] # Align dates
+                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['ind_netprps'], name='개인'), row=3, col=1)
+                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['for_netprps'], name='외국인'), row=3, col=1)
+                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['orgn_netprps'], name='기관'), row=3, col=1)
+                    fig.update_layout(barmode='group', yaxis3_title_text='순매수 금액')
                 else:
-                    self._log("warning", "CHART", "투자자 컬럼 없음", available=list(self.inv_df.columns))
-            else:
-                self._log("warning", "CHART", "투자자 데이터 없음으로 차트 생략")
-        except Exception as ex:
-            self._log("error", "CHART", "수급 차트 생성 실패", error=str(ex), tb=traceback.format_exc())
+                    st.warning("투자자별 매매동향 데이터를 차트에 표시할 수 없습니다. API 응답을 확인하세요.")
 
-    # ---------- 내보내기 ----------
-    def export(self) -> Path | None:
-        out_dir = Path("./reports"); out_dir.mkdir(exist_ok=True)
-        base = f"report_{self.ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        html_path = out_dir / f"{base}.html"
-
-        # ---------- HTML (항상 생성, 풀 콘텐츠) ----------
-        try:
-            parts = []
-            parts.append("""
-            <html><head><meta charset="utf-8">
-            <style>
-              body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans KR',Arial,sans-serif;margin:24px;}
-              h1,h2,h3{margin:8px 0;}
-              .kpi{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0 16px;}
-              .kpi div{background:#f6f6f8;padding:10px 12px;border-radius:10px;}
-              table{border-collapse:collapse;width:100%;font-size:14px;}
-              td,th{border:1px solid #eee;padding:6px 8px;text-align:right;}
-              th:first-child,td:first-child{text-align:left;}
-              .section{margin-top:24px;}
-              .caption{color:#777;font-size:12px;margin-top:-10px;}
-            </style>
-            </head><body>
-            """)
-            parts.append(f"<h2>종합 보고서: {self.ticker_name} ({self.ticker})</h2>")
-            parts.append(f"<p>생성일: {datetime.now():%Y-%m-%d %H:%M}</p>")
-
-            # KPI
-            parts.append('<div class="kpi">')
-            if self.current_price:
-                parts.append(f"<div>확정 종가: <b>{self.current_price:,.0f}원</b></div>")
-            if self._price_info:
-                parts.append(f"<div>최근일 잠정: <b>{self._price_info['latest_close']:,.0f}원</b></div>")
-            if self.dcf:
-                parts.append(f"<div>DCF EV(억원): <b>{self.dcf['enterprise_value']:,.0f}</b></div>")
-                parts.append(f"<div>WACC: <b>{self.dcf['wacc']:.2%}</b></div>")
-            if self.srim:
-                parts.append(f"<div>S-RIM 적정가(원/주): <b>{self.srim['intrinsic_value']:,.0f}</b></div>")
-            parts.append("</div>")
-
-            # 차트(인터랙티브)
-            figs = [f for f in [self.fig_price, self.fig_flow, self.fig_flow_cum] if f is not None]
-            if figs:
-                parts.append('<div class="section"><h3>차트</h3>')
-                first = True
-                for fig in figs:
-                    html_fig = pio.to_html(fig, full_html=False, include_plotlyjs=True if first else False,
-                                           config={"displaylogo": False, "responsive": True})
-                    parts.append(html_fig); first = False
-                parts.append("</div>")
-
-            # 재무 표
-            if self.metrics:
-                df = pd.DataFrame(self.metrics).T.round(0)
-                parts.append('<div class="section"><h3>재무 지표(요약)</h3>')
-                parts.append(df.to_html(border=0, justify="right"))
-                parts.append("</div>")
-
-            # 수급 표
-            if self.inv_df is not None and not self.inv_df.empty:
-                tmp = self.inv_df.copy(); tmp.index = tmp.index.strftime('%Y-%m-%d')
-                parts.append('<div class="section"><h3>투자자별 순매수(일별)</h3>')
-                parts.append('<div class="caption">최근 60영업일</div>')
-                parts.append(tmp.tail(60).to_html(border=0))
-                parts.append("</div>")
-
-            # 디테일 JSON
-            if self.dcf or self.srim:
-                parts.append('<div class="section"><h3>밸류에이션 상세</h3>')
-                if self.dcf:  parts.append(f"<pre>{pd.Series(self.dcf).to_string()}</pre>")
-                if self.srim: parts.append(f"<pre>{pd.Series(self.srim).to_string()}</pre>")
-                parts.append("</div>")
-
-            parts.append("</body></html>")
-            html_path.write_text("".join(parts), encoding="utf-8")
-            self._log("info", "EXPORT", "HTML 저장 완료", path=str(html_path))
-        except Exception as ex:
-            self._log("error", "EXPORT", "HTML 저장 실패", error=str(ex), tb=traceback.format_exc())
-            return None
-
-        # ---------- PDF (kaleido 있을 때만 이미지 삽입) ----------
-        if REPORTLAB_AVAILABLE and KALEIDO_AVAILABLE:
-            pdf_path = out_dir / f"{base}.pdf"
-            try:
-                from reportlab.lib.pagesizes import A4
-                from reportlab.pdfgen import canvas as pdf_canvas
-                from reportlab.lib.units import cm
-                c = pdf_canvas.Canvas(str(pdf_path), pagesize=A4)
-                w, h = A4; y = h - 2 * cm
-
-                # (선택) 한글 폰트 등록
-                try:
-                    from reportlab.pdfbase import pdfmetrics
-                    from reportlab.pdfbase.ttfonts import TTFont
-                    if Path("NanumGothic.ttf").exists():
-                        pdfmetrics.registerFont(TTFont("NanumGothic", "NanumGothic.ttf"))
-                        font = "NanumGothic"
-                    else:
-                        font = "Helvetica"
-                except Exception:
-                    font = "Helvetica"
-
-                c.setFont(font, 16); c.drawString(2*cm, y, f"종합 보고서: {self.ticker_name} ({self.ticker})"); y -= 0.9*cm
-                c.setFont(font, 10); c.drawString(2*cm, y, f"생성일: {datetime.now():%Y-%m-%d %H:%M}"); y -= 0.6*cm
-                if self.current_price is not None:
-                    c.drawString(2*cm, y, f"확정 종가: {self.current_price:,.0f}원"); y -= 0.6*cm
-                if self._price_info:
-                    c.drawString(2*cm, y, f"최근일 잠정: {self._price_info['latest_close']:,.0f}원 ({self._price_info['latest_date']})"); y -= 0.6*cm
-                if self.dcf:
-                    c.drawString(2*cm, y, f"DCF EV(억원): {self.dcf['enterprise_value']:,.0f} / WACC {self.dcf['wacc']:.2%}"); y -= 0.6*cm
-                if self.srim:
-                    c.drawString(2*cm, y, f"S-RIM 적정가: {self.srim['intrinsic_value']:,.0f}원/주"); y -= 0.8*cm
-
-                def draw_fig(fig, yy):
-                    img = out_dir / f"{base}_{np.random.randint(1e9)}.png"
-                    pio.write_image(fig, str(img), width=1000, height=520, scale=2)
-                    h_img = 9.2*cm
-                    c.drawImage(str(img), 1.5*cm, yy - h_img, width=w - 3*cm, height=h_img, preserveAspectRatio=True)
-                    try: img.unlink()
-                    except Exception: pass
-                    return yy - (h_img + 0.6*cm)
-
-                for fig in [self.fig_price, self.fig_flow, self.fig_flow_cum]:
-                    if fig is None: continue
-                    if y < 12*cm: c.showPage(); y = h - 2*cm; c.setFont(font, 10)
-                    y = draw_fig(fig, y)
-
-                c.showPage(); c.save()
-                self._log("info", "EXPORT", "PDF 저장 완료", path=str(pdf_path))
-                return pdf_path
-            except Exception as ex:
-                self._log("error", "EXPORT", "PDF 저장 실패", error=str(ex), tb=traceback.format_exc())
-                return html_path
-
-        # kaleido 없으면 HTML만 반환
-        return html_path
-
-    # ---------- 렌더 ----------
-    def render(self):
-        for m in self.warnings:
-            st.warning(m)
-
-        st.subheader("📌 개요")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric("종목명", self.ticker_name)
-        with c2: st.metric("종목코드", self.ticker)
-        with c3: st.metric("분석기간(영업일)", f"{self.days}")
-        with c4:
-            if self._price_info:
-                st.metric("현재가(확정)", f"{self.current_price:,.0f}원" if self.current_price else "N/A")
-                st.caption(
-                    f"최근일(잠정) 종가: {self._price_info['latest_close']:,.0f}원 "
-                    f"({self._price_info['latest_date']}) · "
-                    f"확정 종가: {self._price_info['settled_close']:,.0f}원 "
-                    f"({self._price_info['settled_date']})"
-                )
-            else:
-                st.metric("현재가", f"{self.current_price:,.0f}원" if self.current_price else "N/A")
-
-        st.markdown("---")
-        st.subheader("📈 가격 추이")
-        if self.fig_price: st.plotly_chart(self.fig_price, use_container_width=True)
-        else: st.info("가격 데이터를 불러오지 못했습니다.")
-
-        st.markdown("---")
-        st.subheader("👥 투자자 수급")
-        if self.fig_flow:
-            col = st.columns(2)
-            with col[0]: st.plotly_chart(self.fig_flow, use_container_width=True)
-            with col[1]:
-                if self.fig_flow_cum: st.plotly_chart(self.fig_flow_cum, use_container_width=True)
-        else:
-            st.info("투자자별 순매수 데이터를 불러오지 못했습니다.")
-
-        st.markdown("---")
-        st.subheader("💰 밸류에이션 요약 (DCF/S-RIM)")
-        if self.dcf or self.srim:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if self.dcf:
-                    st.metric("DCF EV(억원)", f"{self.dcf['enterprise_value']:,.0f}")
-                    st.caption(f"WACC {self.dcf['wacc']:.2%} | g {self.dcf['growth']:.2%} | margin {self.dcf['margin']:.2%}")
+            else: # Fallback line chart
+                fig = make_subplots(rows=1, cols=1, subplot_titles=(daily_title,))
+                if 'close' in df_daily_filtered.columns:
+                    fig.add_trace(go.Scatter(x=df_daily_filtered.index, y=df_daily_filtered['close'], mode='lines', name='종가'))
                 else:
-                    st.metric("DCF EV(억원)", "N/A")
-            with c2:
-                if self.srim:
-                    st.metric("S-RIM 적정가(원/주)", f"{self.srim['intrinsic_value']:,.0f}")
-                    st.caption(f"ROE {self.srim['sustainable_roe']:.2%} | r {self.srim['required_return']:.2%}")
-                else:
-                    st.metric("S-RIM 적정가", "N/A")
-            with c3:
-                if self.srim and self.current_price:
-                    fair = self.srim["intrinsic_value"]
-                    pct = (fair - self.current_price) / self.current_price * 100
-                    st.metric("현재가 대비", f"{pct:+.1f}%")
-                else:
-                    st.metric("현재가 대비", "N/A")
-            with st.expander("DCF 상세"):
-                st.json(self.dcf or {"info": "데이터 없음"})
-            with st.expander("S-RIM 상세"):
-                st.json(self.srim or {"info": "데이터 없음"})
-        else:
-            st.info("밸류에이션을 계산할 충분한 데이터가 없습니다.")
+                    st.error(f"일봉 대체 데이터에 'close' 컬럼이 없습니다. 사용 가능한 컬럼: {df_daily_filtered.columns.tolist()}")
+                    fig = None
+            
+            if fig:
+                fig.update_xaxes(rangebreaks=rangebreaks)
+                fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=700, margin=dict(l=10, r=10, b=10, t=40))
+                st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("---")
-        st.subheader("📊 재무 지표(요약)")
-        if self.metrics:
-            df = pd.DataFrame(self.metrics).T.round(0)
-            st.dataframe(df.style.format("{:,.0f}"), use_container_width=True)
-        else:
-            st.info("재무 데이터가 없습니다.")
+        # --- Weekly & Monthly Charts (Unchanged) ---
+        chart_data = {
+            '주봉 (1년)': df_weekly[df_weekly.index >= (pd.Timestamp.now() - pd.DateOffset(years=1))],
+            '월봉 (3년)': df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))]
+        }
 
-        st.markdown("---")
-        st.subheader("📎 부록")
-        st.caption("원천 데이터 일부를 확인할 수 있습니다.")
-        with st.expander("가격 데이터"):
-            if self.price_df is not None and not self.price_df.empty:
-                tmp = self.price_df.copy(); tmp.index = tmp.index.strftime("%Y-%m-%d")
-                st.dataframe(tmp, use_container_width=True)
-            else:
-                st.write("N/A")
-        with st.expander("투자자별 순매수(일별)"):
-            if self.inv_df is not None and not self.inv_df.empty:
-                tmp = self.inv_df.copy(); tmp.index = tmp.index.strftime("%Y-%m-%d")
-                st.dataframe(tmp, use_container_width=True)
-            else:
-                st.write("N/A")
+        for title, df in chart_data.items():
+            if df.empty or not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+                st.warning(f"{title} 데이터를 표시할 수 없습니다. (필수 데이터 부족)")
+                continue
 
-        st.markdown("---")
-        with st.expander("🔧 진단 로그 (수집/계산 과정)", expanded=True):
-            if self.logs:
-                df = pd.DataFrame(self.logs)
-                if "context" not in df.columns:
-                    df["context"] = ""
-                def _fmt_ctx(x):
-                    if x is None: return ""
-                    if isinstance(x, float) and (math.isnan(x) or np.isnan(x)): return ""
-                    if isinstance(x, dict): return "; ".join(f"{k}={v}" for k, v in x.items())
-                    return str(x)
-                df["context"] = df["context"].apply(_fmt_ctx)
-                order = [c for c in ["ts", "level", "stage", "message", "context"] if c in df.columns]
-                st.dataframe(df[order], use_container_width=True, height=260)
-            else:
-                st.write("로그가 없습니다.")
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=(f'{company_name} {title}', '거래량'), row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='캔들'), row=1, col=1)
 
+            if 'volume' in df.columns:
+                colors = ['red' if c < o else 'green' for o, c in zip(df['open'], df['close'])]
+                fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='거래량', marker_color=colors), row=2, col=1)
 
-# =============================
-# Streamlit 진입점(메인에서 호출)
-# =============================
+            if len(df) >= 5:
+                df['ma5'] = df['close'].rolling(window=5).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=df['ma5'], name='MA 5', line=dict(color='orange', width=1)), row=1, col=1)
+            if len(df) >= 20:
+                df['ma20'] = df['close'].rolling(window=20).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=df['ma20'], name='MA 20', line=dict(color='purple', width=1)), row=1, col=1)
 
-def run():
-    # rerun에도 보고서를 유지하기 위해 세션 상태 사용
-    if "rpt" not in st.session_state:
-        st.session_state.rpt = None
-    if "report_ready" not in st.session_state:
-        st.session_state.report_ready = False
+            fig.update_xaxes(rangebreaks=rangebreaks)
+            fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.title("📊 주식 분석 (종합 보고서)")
+# --- Main Application ---
 
-    # 메인 앱 사이드바를 침범하지 않도록, 본문 상단 컨트롤 패널 사용
-    with st.container():
-        with st.form("controls"):
-            st.subheader("⚙️ 분석 설정")
-            c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
-            with c1:
-                ticker = st.text_input("종목 코드", value="005930", help="예: 005930 (삼성전자)")
-            with c2:
-                days = st.slider("분석 기간(영업일)", 7, 180, 90, step=1)
-            with c3:
-                beta = st.number_input("베타", value=1.0, min_value=0.1, max_value=3.0, step=0.1)
-            with c4:
-                years = st.selectbox("재무 반영 연수", [3, 5, 7], index=1)
+def main():
+    st.set_page_config(layout="wide")
+    today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
 
-            with st.expander("고급 설정", expanded=False):
-                use_dart = st.checkbox("DART 사용", value=bool(DART_KEY), help="config.ini에 키가 있어야 활성화됩니다.")
+    if 'config_manager' not in st.session_state: st.session_state.config_manager = ConfigManager(ROOT_DIR)
+    if 'gemini_handler' not in st.session_state: st.session_state.gemini_handler = GeminiAPIHandler(st.session_state.config_manager.get_gemini_key())
+    if 'kiwoom_handler' not in st.session_state:
+        k_key, k_secret, _, k_url = st.session_state.config_manager.get_kiwoom_config()
+        st.session_state.kiwoom_handler = KiwoomAPIHandler(k_key, k_secret, k_url)
 
-            submitted = st.form_submit_button("📄 종합 보고서 생성")
+    states_to_init = {
+        "gemini_analysis": "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요.",
+        "main_business": "-", "investment_summary": "-", "kiwoom_data": {},
+        "df_forecast": get_empty_forecast_df(), "gemini_api_calls": 0,
+        "kiwoom_token": None, "kiwoom_token_expires_at": 0
+    }
+    for key, value in states_to_init.items():
+        if key not in st.session_state: st.session_state[key] = value
 
-    # 제출 시 새 보고서 생성 → 세션에 저장
-    if submitted:
-        rpt = ReportBuilder(ticker=ticker, days=days, beta=beta, years=years, use_dart=use_dart)
-        if rpt.validate():
-            with st.spinner("데이터 수집 중..."):
-                rpt.collect()
-            with st.spinner("차트 구성 중..."):
-                rpt.build_charts()
-            st.session_state.rpt = rpt
-            st.session_state.report_ready = True
-        else:
-            for e in rpt.errors:
-                st.error(e)
+    title_col, info_col = st.columns([3, 1])
+    with title_col: st.title("AI 기반 투자 분석 리포트")
+    with info_col: st.markdown(f"<div style='text-align: right;'><b>조회 기준일:</b> {today_str}<br><b>애널리스트:</b> Gemini 1.5 Flash</div>", unsafe_allow_html=True)
+    st.divider()
 
-    # 제출 여부와 관계없이, 세션의 보고서를 항상 렌더
-    if st.session_state.report_ready and st.session_state.rpt:
-        rpt = st.session_state.rpt
-        rpt.render()
-
-        st.markdown("---")
-        st.subheader("🖨️ 보고서 내보내기")
-        col1, col2 = st.columns([1, 3])
+    with st.expander("⚙️ 분석 설정 (기업, 모델 변수 등)", expanded=True):
+        col1, col2, col3 = st.columns([2, 2, 1])
         with col1:
-            if st.button("PDF/HTML 저장", key="export_btn", use_container_width=True):
-                out = rpt.export()
-                if out and out.exists():
-                    st.success(f"저장 완료: {out.name}")
-                    try:
-                        st.download_button("다운로드", data=open(out, "rb").read(), file_name=out.name, key=f"dl_{out.name}")
-                    except Exception:
-                        st.info("다운로드 제한 시, 보고서 폴더의 파일을 직접 확인하세요.")
-                else:
-                    st.error("내보내기에 실패했습니다.")
-        with col2:
-            st.caption("ReportLab + kaleido 설치 시 PDF, 미설치 시 HTML로 자동 저장됩니다. HTML은 브라우저 인쇄로 PDF 저장 가능.")
-    else:
-        st.info("상단의 설정을 입력하고 ‘종합 보고서 생성’을 눌러주세요.")
+            st.markdown("**분석 대상**")
+            df_listing = get_stock_list()
+            if not df_listing.empty:
+                df_listing['display'] = df_listing['name'] + ' (' + df_listing['code'] + ')'
+                stock_options = df_listing['display'].tolist()
+                default_index = stock_options.index("SK하이닉스 (000660)") if "SK하이닉스 (000660)" in stock_options else 0
+                selected_stock = st.selectbox("기업 선택", stock_options, index=default_index, on_change=reset_states_on_stock_change, key='selected_stock', label_visibility="collapsed")
+                company_name, stock_code = re.match(r"(.+) \((.+)\)", selected_stock).groups() if selected_stock else ("", "")
+            else:
+                company_name, stock_code = st.text_input("기업명", "SK하이닉스"), st.text_input("종목코드", "000660")
 
+            btn_cols = st.columns(2)
+            if btn_cols[0].button("📈 정보 조회", use_container_width=True):
+                with st.spinner("키움 API에서 최신 정보를 조회 중입니다..."):
+                    kiwoom_data = get_kiwoom_stock_info(stock_code)
+                    if kiwoom_data:
+                        st.session_state.kiwoom_data = kiwoom_data
+                        df_new = st.session_state.df_forecast.copy()
+                        df_new.loc['EPS (원)', '2023A'], df_new.loc['BPS (원)', '2023A'], df_new.loc['ROE (%)', '2023A'] = kiwoom_data.get('eps', 0), kiwoom_data.get('bps', 0), kiwoom_data.get('roe', 0)
+                        st.session_state.df_forecast = df_new
+                        st.success("정보 조회가 완료되었습니다.")
+                    else: st.error("정보 조회에 실패했습니다.")
+
+            if btn_cols[1].button("✨ AI 분석", use_container_width=True):
+                st.session_state.gemini_api_calls += 1
+                with st.spinner('Gemini가 최신 정보를 분석 중입니다...'):
+                    system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
+                    user_prompt = f'''**기업 분석 요청**
+- **분석 대상:** {company_name}({stock_code})
+- **요청 사항:**
+  1. 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
+  2. 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
+  3. 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
+
+**[결과 출력 형식]**
+### 주요 사업
+[내용]
+
+### 핵심 투자 요약
+[내용]
+
+### 긍정적 투자 포인트
+**1. [제목]**
+- [근거]
+**2. [제목]**
+- [근거]
+
+### 잠재적 리스크 요인
+**1. [제목]**
+- [근거]
+**2. [제목]**
+- [근거]'''
+                    full_response = generate_gemini_content(user_prompt, system_prompt)
+                    try:
+                        parts = full_response.split('###')
+                        st.session_state.main_business = parts[1].replace('주요 사업', '').strip()
+                        st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
+                        st.session_state.gemini_analysis = "###" + "###".join(parts[3:])
+                    except Exception:
+                        st.session_state.main_business, st.session_state.investment_summary = "-", "-"
+                        st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{full_response}"
+            st.caption(f"AI 분석 호출 (세션): {st.session_state.gemini_api_calls}")
+
+        with col2:
+            st.markdown("**가치평가 모델**")
+            est_roe = st.slider("예상 ROE (%)", 0.0, 50.0, st.session_state.kiwoom_data.get('roe', 10.0), 0.1)
+            cost_of_equity = st.slider("자기자본비용 (Ke, %)", 5.0, 15.0, 9.0, 0.1)
+            terminal_growth = st.slider("영구성장률 (g, %)", 0.0, 5.0, 3.0, 0.1)
+        with col3:
+            st.markdown("**목표주가 변수**")
+            est_bps = st.number_input("예상 BPS (원)", value=int(st.session_state.kiwoom_data.get('bps', 150000)))
+
+    target_pbr = ValuationCalculator.calculate_target_pbr(est_roe, cost_of_equity, terminal_growth)
+    calculated_target_price = ValuationCalculator.calculate_target_price(target_pbr, est_bps)
+    current_price = st.session_state.kiwoom_data.get('price', 0)
+    investment_opinion, upside_potential = ValuationCalculator.get_investment_opinion(current_price, calculated_target_price)
+    st.divider()
+
+    st.header("1. 요약 (Executive Summary)")
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("투자의견", investment_opinion)
+    summary_cols[1].metric("현재주가", f"{current_price:,.0f} 원" if current_price else "N/A")
+    summary_cols[2].metric("목표주가", f"{calculated_target_price:,.0f} 원")
+    summary_cols[3].metric("상승여력", f"{upside_potential:.2f} %")
+    st.info(f"**핵심 투자 요약:**\n\n> {st.session_state.investment_summary}")
+    st.divider()
+
+    main_col1, main_col2 = st.columns(2)
+    with main_col1:
+        st.subheader("2. 기업 개요")
+        market_cap = st.session_state.kiwoom_data.get('market_cap', 0)
+        st.text_input("회사명", company_name, disabled=True)
+        st.text_input("티커", stock_code, disabled=True)
+        st.text_area("주요 사업", st.session_state.main_business, disabled=True)
+        st.text_input("시가총액", f"{market_cap / 100000000:,.0f} 억원" if market_cap > 0 else "N/A", disabled=True)
+        overview_cols = st.columns(2)
+        overview_cols[0].metric("PER", f"{st.session_state.kiwoom_data.get('per', 0):.2f} 배")
+        overview_cols[1].metric("PBR", f"{st.session_state.kiwoom_data.get('pbr', 0):.2f} 배")
+        overview_cols[0].metric("52주 최고", f"{st.session_state.kiwoom_data.get('high_52w', 0):,.0f} 원")
+        overview_cols[1].metric("52주 최저", f"{st.session_state.kiwoom_data.get('low_52w', 0):,.0f} 원")
+    with main_col2:
+        st.subheader("3. Gemini 종합 분석")
+        with st.container(border=True): st.markdown(st.session_state.gemini_analysis)
+    st.divider()
+
+    st.header("4. 실적 전망 (Earnings Forecast)")
+    st.caption("아래 표의 데이터를 직접 수정하여 목표주가 계산에 실시간으로 반영할 수 있습니다.")
+    st.session_state.df_forecast = st.data_editor(st.session_state.df_forecast, use_container_width=True)
+    st.divider()
+
+    st.header("5. 가치평가 (Valuation)")
+    val_col1, val_col2 = st.columns(2)
+    with val_col1:
+        st.markdown(f"- **(A) 예상 ROE:** `{est_roe:.2f} %`")
+        st.markdown(f"- **(B) 자기자본비용 (Ke):** `{cost_of_equity:.2f} %`")
+        st.markdown(f"- **(C) 영구성장률 (g):** `{terminal_growth:.2f} %`")
+    with val_col2: st.success(f"**목표 PBR (배):** `{target_pbr:.2f}` 배")
+    st.subheader("5.2. 목표주가 산출")
+    val2_col1, val2_col2 = st.columns(2)
+    with val2_col1:
+        st.markdown(f"- **(D) 목표 PBR:** `{target_pbr:.2f}` 배")
+        st.markdown(f"- **(E) 예상 BPS:** `{est_bps:,.0f}` 원")
+    with val2_col2: st.success(f"**목표주가 (원):** `{calculated_target_price:,.0f}` 원")
+    st.divider()
+
+    st.header("6. 주가 차트 (Stock Chart)")
+    if st.button("📊 주가 & 투자자 동향 차트 생성", help="키움 API를 통해 일봉, 주봉, 월봉 및 투자자별 동향 차트를 조회합니다.", use_container_width=True):
+        display_candlestick_chart(stock_code, company_name)
+    st.divider()
+    st.write("*본 보고서는 외부 출처로부터 얻은 정보에 기반하며, 정확성을 보장하지 않습니다. 투자 결정에 대한 최종 책임은 투자자 본인에게 있습니다.*")
 
 if __name__ == "__main__":
-    run()
+    main()

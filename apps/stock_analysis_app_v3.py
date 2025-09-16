@@ -406,6 +406,91 @@ class KiwoomAPIHandler:
         data_list = self._fetch_chart_data(token, 'ka10059', '/api/dostk/stkinfo', params)
         return self._process_chart_dataframe(data_list)
 
+    def _fetch_holdings_data(self, token, api_id, stock_code):
+        url = f'{self.base_url}/api/dostk/frgnistt'
+        headers = {
+            'Content-Type': 'application/json;charset=UTF-8',
+            'authorization': f'Bearer {token}',
+            'appkey': self.app_key,
+            'appsecret': self.app_secret,
+            'api-id': api_id,
+        }
+        params = {'stk_cd': stock_code}
+        try:
+            response = requests.post(url, headers=headers, json=params)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('return_code') != 0:
+                st.error(f"API Error for {api_id}: {response_data.get('return_msg')}")
+                return []
+            
+            # The user's sample code suggests 'stk_frgnr' as the key for both.
+            # We'll assume this is correct for now, but be aware it might need adjustment.
+            if 'stk_frgnr' in response_data and isinstance(response_data['stk_frgnr'], list):
+                return response_data['stk_frgnr']
+            
+            return []
+        except requests.exceptions.RequestException as e:
+            st.error(f"키움 API ({api_id}) 호출 중 오류 발생: {e}")
+            if e.response:
+                st.error(f"응답 내용: {e.response.text}")
+            return []
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            st.error(f"API 응답 데이터 처리 중 오류 발생: {e}")
+            return []
+
+    def fetch_investor_holdings(self, stock_code):
+        token = self.get_token()
+        if not token:
+            return pd.DataFrame()
+
+        stock_info = self.get_stock_info(stock_code)
+        current_price = stock_info.get('price', 0)
+        market_cap = stock_info.get('market_cap', 0) # Already in KRW
+
+        if current_price <= 0 or market_cap <= 0:
+            st.warning("현재가 또는 시가총액 정보를 가져올 수 없어 총 상장 주식 수를 계산할 수 없습니다.")
+            return pd.DataFrame()
+
+        # Calculate total shares (assuming market_cap is in KRW and price is in KRW)
+        total_shares = market_cap / current_price
+        
+        foreign_data_list = self._fetch_holdings_data(token, 'ka10008', stock_code)
+        institution_data_list = self._fetch_holdings_data(token, 'ka10009', stock_code)
+
+        df_foreign = pd.DataFrame(foreign_data_list)
+        df_institution = pd.DataFrame(institution_data_list)
+
+        # Process and merge data
+        if df_foreign.empty and df_institution.empty:
+            return pd.DataFrame()
+
+        # Standardize column names and convert types
+        def process_holdings_df(df, investor_type):
+            if df.empty:
+                return pd.DataFrame()
+            df.rename(columns={'dt': 'date', 'poss_stkcnt': f'{investor_type}_holdings'}, inplace=True)
+            df['date'] = pd.to_datetime(df['date'])
+            df[f'{investor_type}_holdings'] = pd.to_numeric(df[f'{investor_type}_holdings'], errors='coerce').fillna(0)
+            return df.set_index('date')
+
+        df_foreign_processed = process_holdings_df(df_foreign, 'foreign')
+        df_institution_processed = process_holdings_df(df_institution, 'institution')
+
+        # Merge on date
+        df_holdings = pd.merge(df_foreign_processed, df_institution_processed, left_index=True, right_index=True, how='outer')
+        df_holdings.fillna(0, inplace=True)
+
+        # Calculate individual holdings
+        if not df_holdings.empty:
+            df_holdings['total_shares'] = total_shares # Add total shares as a column for context
+            df_holdings['individual_holdings'] = df_holdings['total_shares'] - df_holdings['foreign_holdings'] - df_holdings['institution_holdings']
+            # Ensure individual holdings don't go negative due to data discrepancies or rounding
+            df_holdings['individual_holdings'] = df_holdings['individual_holdings'].clip(lower=0)
+
+        return df_holdings
+
 class ValuationCalculator:
     @staticmethod
     def calculate_target_pbr(roe, cost_of_equity, terminal_growth):
@@ -469,90 +554,88 @@ def display_candlestick_chart(stock_code, company_name):
         return
 
     with st.spinner("주가 및 투자자 동향 데이터를 조회하고 차트를 생성 중입니다..."):
-        rangebreaks = [dict(bounds=["sat", "mon"]) # 주말 제외
-        ]
+        rangebreaks = [dict(bounds=["sat", "mon"])]  # 주말 제외
         df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
 
-        # --- Daily Chart with Investor Data ---
-        df_daily_filtered = df_daily[df_daily.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
-        has_ohlc = not df_daily_filtered.empty and all(col in df_daily_filtered.columns for col in ['open', 'high', 'low', 'close'])
+        col1, col2 = st.columns(2)
 
-        if not has_ohlc:
-            st.warning("API에서 일봉 OHLC 데이터를 제공하지 않아, 종가 기준 꺾은선 차트를 표시합니다.")
-            df_daily_fallback = st.session_state.kiwoom_handler.fetch_daily_fallback_data(stock_code)
-            df_daily_filtered = df_daily_fallback[df_daily_fallback.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
+        with col1:
+            # --- Daily Chart with Investor Data ---
+            st.subheader("일봉 & 투자자 동향")
+            df_daily_filtered = df_daily[df_daily.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
+            has_ohlc = not df_daily_filtered.empty and all(col in df_daily_filtered.columns for col in ['open', 'high', 'low', 'close'])
 
-        if not df_daily_filtered.empty:
-            daily_title = f'{company_name} 일봉 (3개월)'
-            fig = None
-            if has_ohlc:
-                # --- Fetch investor data ---
-                df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+            if not df_daily.empty and not has_ohlc:
+                st.warning("API에서 일봉 OHLC 데이터를 제공하지 않아, 종가 기준 꺾은선 차트를 표시합니다.")
+                df_daily_fallback = st.session_state.kiwoom_handler.fetch_daily_fallback_data(stock_code)
+                df_daily_filtered = df_daily_fallback[df_daily_fallback.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
+            elif df_daily.empty:
+                st.warning("일봉 데이터를 가져올 수 없습니다.")
+                df_daily_filtered = pd.DataFrame() # Ensure it's an empty dataframe
+
+            if not df_daily_filtered.empty:
+                daily_title = f'{company_name} 일봉 (3개월)'
+                fig_daily = None
+                if has_ohlc:
+                    df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+                    fig_daily = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                                              subplot_titles=(daily_title, '거래량', '투자자별 매매동향 (순매수, 백만원)'),
+                                              row_heights=[0.5, 0.2, 0.3])
+                    fig_daily.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
+                    if 'volume' in df_daily_filtered.columns:
+                        colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
+                        fig_daily.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
+                    if not df_investor.empty and all(c in df_investor.columns for c in ['ind_netprps', 'for_netprps', 'orgn_netprps']):
+                        df_investor_filtered = df_investor[df_investor.index.isin(df_daily_filtered.index)]
+                        fig_daily.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['ind_netprps'], name='개인'), row=3, col=1)
+                        fig_daily.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['for_netprps'], name='외국인'), row=3, col=1)
+                        fig_daily.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['orgn_netprps'], name='기관'), row=3, col=1)
+                        fig_daily.update_layout(barmode='group', yaxis3_title_text='순매수 금액')
+                    else:
+                        st.warning("투자자별 매매동향 데이터를 차트에 표시할 수 없습니다.")
+                else: # Fallback line chart
+                    fig_daily = make_subplots(rows=1, cols=1, subplot_titles=(daily_title,))
+                    if 'close' in df_daily_filtered.columns:
+                        fig_daily.add_trace(go.Scatter(x=df_daily_filtered.index, y=df_daily_filtered['close'], mode='lines', name='종가'))
+                    else:
+                        st.error(f"일봉 대체 데이터에 'close' 컬럼이 없습니다.")
+                        fig_daily = None
                 
-                # --- Create subplots (add row for investor data) ---
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
-                                    subplot_titles=(daily_title, '거래량', '투자자별 매매동향 (순매수, 백만원)'), 
-                                    row_heights=[0.5, 0.2, 0.3])
+                if fig_daily:
+                    fig_daily.update_xaxes(rangebreaks=rangebreaks)
+                    fig_daily.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=600, margin=dict(l=10, r=10, b=10, t=40))
+                    st.plotly_chart(fig_daily, use_container_width=True)
 
-                # Candlestick Trace
-                fig.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
-                
-                # Volume Trace
-                if 'volume' in df_daily_filtered.columns:
-                    colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
-                    fig.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
+        with col2:
+            st.subheader("주봉 & 월봉")
+            # --- Weekly & Monthly Charts ---
+            chart_data = {
+                '주봉 (1년)': (df_weekly[df_weekly.index >= (pd.Timestamp.now() - pd.DateOffset(years=1))], 300),
+                '월봉 (3년)': (df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))], 300)
+            }
 
-                # Investor Traces
-                if not df_investor.empty and all(c in df_investor.columns for c in ['ind_netprps', 'for_netprps', 'orgn_netprps']):
-                    df_investor_filtered = df_investor[df_investor.index.isin(df_daily_filtered.index)] # Align dates
-                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['ind_netprps'], name='개인'), row=3, col=1)
-                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['for_netprps'], name='외국인'), row=3, col=1)
-                    fig.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['orgn_netprps'], name='기관'), row=3, col=1)
-                    fig.update_layout(barmode='group', yaxis3_title_text='순매수 금액')
-                else:
-                    st.warning("투자자별 매매동향 데이터를 차트에 표시할 수 없습니다. API 응답을 확인하세요.")
+            for title, (df, height) in chart_data.items():
+                if df.empty or not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+                    st.warning(f"{title} 데이터를 표시할 수 없습니다. (필수 데이터 부족)")
+                    continue
 
-            else: # Fallback line chart
-                fig = make_subplots(rows=1, cols=1, subplot_titles=(daily_title,))
-                if 'close' in df_daily_filtered.columns:
-                    fig.add_trace(go.Scatter(x=df_daily_filtered.index, y=df_daily_filtered['close'], mode='lines', name='종가'))
-                else:
-                    st.error(f"일봉 대체 데이터에 'close' 컬럼이 없습니다. 사용 가능한 컬럼: {df_daily_filtered.columns.tolist()}")
-                    fig = None
-            
-            if fig:
-                fig.update_xaxes(rangebreaks=rangebreaks)
-                fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=700, margin=dict(l=10, r=10, b=10, t=40))
-                st.plotly_chart(fig, use_container_width=True)
+                fig_period = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=(f'{company_name} {title}', '거래량'), row_heights=[0.7, 0.3])
+                fig_period.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='캔들'), row=1, col=1)
 
-        # --- Weekly & Monthly Charts (Unchanged) ---
-        chart_data = {
-            '주봉 (1년)': df_weekly[df_weekly.index >= (pd.Timestamp.now() - pd.DateOffset(years=1))],
-            '월봉 (3년)': df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))]
-        }
+                if 'volume' in df.columns:
+                    colors = ['red' if c < o else 'green' for o, c in zip(df['open'], df['close'])]
+                    fig_period.add_trace(go.Bar(x=df.index, y=df['volume'], name='거래량', marker_color=colors), row=2, col=1)
 
-        for title, df in chart_data.items():
-            if df.empty or not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
-                st.warning(f"{title} 데이터를 표시할 수 없습니다. (필수 데이터 부족)")
-                continue
+                if len(df) >= 5:
+                    df['ma5'] = df['close'].rolling(window=5).mean()
+                    fig_period.add_trace(go.Scatter(x=df.index, y=df['ma5'], name='MA 5', line=dict(color='orange', width=1)), row=1, col=1)
+                if len(df) >= 20:
+                    df['ma20'] = df['close'].rolling(window=20).mean()
+                    fig_period.add_trace(go.Scatter(x=df.index, y=df['ma20'], name='MA 20', line=dict(color='purple', width=1)), row=1, col=1)
 
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, subplot_titles=(f'{company_name} {title}', '거래량'), row_heights=[0.7, 0.3])
-            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='캔들'), row=1, col=1)
-
-            if 'volume' in df.columns:
-                colors = ['red' if c < o else 'green' for o, c in zip(df['open'], df['close'])]
-                fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='거래량', marker_color=colors), row=2, col=1)
-
-            if len(df) >= 5:
-                df['ma5'] = df['close'].rolling(window=5).mean()
-                fig.add_trace(go.Scatter(x=df.index, y=df['ma5'], name='MA 5', line=dict(color='orange', width=1)), row=1, col=1)
-            if len(df) >= 20:
-                df['ma20'] = df['close'].rolling(window=20).mean()
-                fig.add_trace(go.Scatter(x=df.index, y=df['ma20'], name='MA 20', line=dict(color='purple', width=1)), row=1, col=1)
-
-            fig.update_xaxes(rangebreaks=rangebreaks)
-            fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=500, margin=dict(l=10, r=10, b=10, t=40))
-            st.plotly_chart(fig, use_container_width=True)
+                fig_period.update_xaxes(rangebreaks=rangebreaks)
+                fig_period.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=height, margin=dict(l=10, r=10, b=10, t=40))
+                st.plotly_chart(fig_period, use_container_width=True)
 
 # --- Main Application ---
 

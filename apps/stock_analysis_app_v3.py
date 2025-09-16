@@ -25,15 +25,21 @@ class ConfigManager:
         self.config = configparser.ConfigParser()
         self.config.read(self.config_path)
 
-    def get_gemini_key(self):
-        """Retrieves the Gemini API key."""
-        gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not gemini_api_key:
-            try:
-                gemini_api_key = self.config.get('GEMINI_API_KEY', 'key', fallback=None)
-            except (configparser.NoSectionError, configparser.NoOptionError):
-                gemini_api_key = None
-        return gemini_api_key
+    def get_gemini_keys(self):
+        """Retrieves a list of Gemini API keys from config or environment variables."""
+        # Try environment variables first (comma-separated)
+        keys_str = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if keys_str:
+            return [key.strip() for key in keys_str.split(',') if key.strip()]
+
+        # If not in env vars, try config.ini
+        try:
+            # Use items() to get (key, value) pairs directly
+            keys = [value for _, value in self.config.items('GEMINI_API_KEY')]
+            # Filter out any empty values
+            return [key for key in keys if key]
+        except configparser.NoSectionError:
+            return []
 
     def get_kiwoom_config(self):
         """Retrieves Kiwoom API configuration."""
@@ -48,29 +54,124 @@ class ConfigManager:
         return app_key, app_secret, mode, base_url
 
 class GeminiAPIHandler:
-    """Handles interactions with the Gemini API."""
-    def __init__(self, api_key):
+    """Handles interactions with the Gemini API with key rotation and model fallback."""
+    def __init__(self, api_keys):
+        self.api_keys = api_keys
+        self.current_key_index = 0
         self.client = None
-        if api_key:
-            try:
-                self.client = genai.Client(api_key=api_key)
-            except Exception as e:
-                st.error(f"Gemini API 클라이언트 초기화 중 오류가 발생했습니다: {e}")
-        else:
+        self.primary_model = 'gemini-1.5-pro'
+        self.fallback_model = 'gemini-1.5-flash'
+
+        if not self.api_keys:
             st.warning("Gemini API 키를 찾을 수 없어 AI 분석 기능이 제한됩니다. 환경 변수 또는 config.ini 파일을 확인해주세요.")
+        else:
+            self._initialize_client()
+
+    def _initialize_client(self):
+        """Initializes the Gemini client with the current API key."""
+        if self.current_key_index < len(self.api_keys):
+            current_key = self.api_keys[self.current_key_index]
+            try:
+                self.client = genai.Client(api_key=current_key)
+                # st.info(f"Gemini 클라이언트를 API Key #{self.current_key_index + 1}로 초기화했습니다.")
+                return True
+            except Exception as e:
+                st.error(f"API Key #{self.current_key_index + 1}로 Gemini 클라이언트 초기화 중 오류: {e}")
+                self.client = None
+                return self.try_next_key() # Try next key if initialization fails
+        else:
+            # This case is hit when all keys have failed initialization
+            if len(self.api_keys) > 0:
+                st.error("사용 가능한 모든 Gemini API 키로 클라이언트를 초기화하는 데 실패했습니다.")
+            self.client = None
+            return False
+
+    def try_next_key(self):
+        """Switches to the next API key and re-initializes the client."""
+        self.current_key_index += 1
+        if self.current_key_index < len(self.api_keys):
+            st.warning(f"API Key #{self.current_key_index}의 사용량이 소진되었거나 오류가 발생했습니다. 다음 키(#{self.current_key_index + 1})로 전환합니다.")
+            return self._initialize_client()
+        else:
+            self.client = None # No more keys
+            return False
 
     def generate_content(self, prompt, system_instruction):
-        """Generates content using the Gemini API."""
-        if self.client is None:
-            return "오류: Gemini 클라이언트가 초기화되지 않았습니다."
-        try:
-            combined_prompt = f"{system_instruction}\n\n{prompt}"
-            response = self.client.models.generate_content(model='models/gemini-1.5-flash', contents=combined_prompt)
-            return response.text
-        except Exception as e:
-            st.error("Gemini API 호출 중 오류가 발생했습니다.")
-            st.exception(e)
-            return "오류로 인해 분석 내용을 생성할 수 없습니다."
+        """
+        Generates content by trying available API keys in sequence.
+        For each key, it tries the primary model first, then the fallback model on ResourceExhausted errors.
+        """
+        if not self.api_keys:
+            return "오류: Gemini API 키가 설정되지 않았습니다."
+
+        from google.api_core.exceptions import ResourceExhausted
+        from google.genai.types import GenerateContentConfig, Tool
+
+        full_prompt = f"{system_instruction}\n\n{prompt}"
+        config = GenerateContentConfig(tools=[Tool(google_search_retrieval={})])
+
+        # Store the starting key index for this request
+        start_index = self.current_key_index
+
+        while self.current_key_index < len(self.api_keys):
+            if not self.client and not self._initialize_client():
+                # If we can't even initialize a client with the current key, try the next one.
+                if not self.try_next_key():
+                    break # No more keys to try
+
+            # 1. Try with the primary model (Pro)
+            try:
+                st.session_state.analyst_model = "Gemini 1.5 Pro"
+                st.info(f"API Key #{self.current_key_index + 1}을(를) 사용하여 '{st.session_state.analyst_model}' 모델로 분석을 시도합니다.")
+                response = self.client.models.generate_content(
+                    model=f'models/{self.primary_model}',
+                    contents=full_prompt,
+                    config=config
+                )
+                return response # Success
+            except ResourceExhausted:
+                st.warning(f"Key #{self.current_key_index + 1}의 '{self.primary_model}' 모델 사용량이 소진되었습니다. 폴백 모델로 전환합니다.")
+                # 2. If exhausted, try with the fallback model (Flash) with the SAME key
+                try:
+                    st.session_state.analyst_model = "Gemini 1.5 Flash"
+                    st.info(f"동일한 API Key #{self.current_key_index + 1}을(를) 사용하여 '{st.session_state.analyst_model}' 모델로 재시도합니다.")
+                    response = self.client.models.generate_content(
+                        model=f'models/{self.fallback_model}',
+                        contents=full_prompt,
+                        config=config
+                    )
+                    return response # Success with fallback
+                except ResourceExhausted:
+                    # Both models are exhausted for the current key, try the next key.
+                    st.warning(f"Key #{self.current_key_index + 1}은(는) 두 모델 모두 사용량이 소진되었습니다.")
+                    if not self.try_next_key():
+                        break # No more keys left, exit the while loop
+                except Exception as e_fallback:
+                    error_message = f"**폴백 모델('{self.fallback_model}') 호출 중 오류 발생 (Key #{self.current_key_index + 1}):**\n\n**오류:**\n`{str(e_fallback)}`"
+                    st.error(error_message)
+                    if not self.try_next_key():
+                        # Restore original index before failing
+                        self.current_key_index = start_index
+                        self._initialize_client()
+                        return error_message # Return last error if no more keys
+            except Exception as e:
+                st.error(f"API Key #{self.current_key_index + 1} 사용 중 오류 발생: {type(e).__name__}")
+                if not self.try_next_key():
+                    # Restore original index before failing
+                    self.current_key_index = start_index
+                    self._initialize_client()
+                    error_message = f"**API 호출 중 오류 발생 ('{self.primary_model}' 모델, Key #{self.current_key_index}):**\n\n**오류:**\n`{str(e)}`"
+                    return error_message
+        
+        # If we've exited the loop, it means all keys from the start_index onwards have failed.
+        # Reset to the starting key for the next attempt.
+        self.current_key_index = start_index
+        self._initialize_client()
+        final_error_message = "**API 호출 최종 실패:** 사용 가능한 모든 API 키의 사용량 한도를 초과했거나, 지속적인 오류가 발생했습니다."
+        st.error(final_error_message)
+        return final_error_message
+
+
 
 class KiwoomAPIHandler:
     """Handles interactions with the Kiwoom REST API."""
@@ -460,7 +561,7 @@ def main():
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
 
     if 'config_manager' not in st.session_state: st.session_state.config_manager = ConfigManager(ROOT_DIR)
-    if 'gemini_handler' not in st.session_state: st.session_state.gemini_handler = GeminiAPIHandler(st.session_state.config_manager.get_gemini_key())
+    if 'gemini_handler' not in st.session_state: st.session_state.gemini_handler = GeminiAPIHandler(st.session_state.config_manager.get_gemini_keys())
     if 'kiwoom_handler' not in st.session_state:
         k_key, k_secret, _, k_url = st.session_state.config_manager.get_kiwoom_config()
         st.session_state.kiwoom_handler = KiwoomAPIHandler(k_key, k_secret, k_url)
@@ -469,14 +570,15 @@ def main():
         "gemini_analysis": "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요.",
         "main_business": "-", "investment_summary": "-", "kiwoom_data": {},
         "df_forecast": get_empty_forecast_df(), "gemini_api_calls": 0,
-        "kiwoom_token": None, "kiwoom_token_expires_at": 0
+        "kiwoom_token": None, "kiwoom_token_expires_at": 0,
+        "analyst_model": "Gemini 1.5 Pro" # Add default model name
     }
     for key, value in states_to_init.items():
         if key not in st.session_state: st.session_state[key] = value
 
     title_col, info_col = st.columns([3, 1])
     with title_col: st.title("AI 기반 투자 분석 리포트")
-    with info_col: st.markdown(f"<div style='text-align: right;'><b>조회 기준일:</b> {today_str}<br><b>애널리스트:</b> Gemini 1.5 Flash</div>", unsafe_allow_html=True)
+    with info_col: st.markdown(f"<div style='text-align: right;'><b>조회 기준일:</b> {today_str}<br><b>애널리스트:</b> {st.session_state.analyst_model}</div>", unsafe_allow_html=True)
     st.divider()
 
     with st.expander("⚙️ 분석 설정 (기업, 모델 변수 등)", expanded=True):
@@ -507,14 +609,14 @@ def main():
 
             if btn_cols[1].button("✨ AI 분석", use_container_width=True):
                 st.session_state.gemini_api_calls += 1
-                with st.spinner('Gemini가 최신 정보를 분석 중입니다...'):
-                    system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 객관적인 데이터와 최신 정보에 기반하여 명확하고 간결하게 핵심을 전달합니다."
+                with st.spinner('Gemini가 최신 정보를 분석하고 출처를 확인 중입니다...'):
+                    system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 웹 검색 기능을 활용하여 가장 최신 정보와 객관적인 데이터를 찾아 분석에 반영해야 합니다. 주장의 근거가 되는 부분에는 반드시 출처를 `[숫자]` 형식으로 명시해야 합니다. 명확하고 간결하게 핵심을 전달합니다."
                     user_prompt = f'''**기업 분석 요청**
 - **분석 대상:** {company_name}({stock_code})
 - **요청 사항:**
-  1. 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
-  2. 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
-  3. 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
+  1. **(최신 정보 기반)** 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
+  2. **(최신 정보 기반)** 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
+  3. **(최신 정보 기반)** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
 
 **[결과 출력 형식]**
 ### 주요 사업
@@ -534,15 +636,34 @@ def main():
 - [근거]
 **2. [제목]**
 - [근거]'''
-                    full_response = generate_gemini_content(user_prompt, system_prompt)
-                    try:
-                        parts = full_response.split('###')
-                        st.session_state.main_business = parts[1].replace('주요 사업', '').strip()
-                        st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
-                        st.session_state.gemini_analysis = "###" + "###".join(parts[3:])
-                    except Exception:
-                        st.session_state.main_business, st.session_state.investment_summary = "-", "-"
-                        st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{full_response}"
+                    response_or_error = generate_gemini_content(user_prompt, system_prompt)
+
+                    # Check if the response is successful by checking for the .text attribute
+                    if hasattr(response_or_error, 'text'):
+                        full_response_obj = response_or_error
+                        response_text = full_response_obj.text
+                        citations = ""
+                        if hasattr(full_response_obj, 'citation_metadata') and full_response_obj.citation_metadata:
+                            citation_sources = full_response_obj.citation_metadata.citation_sources
+                            if citation_sources:
+                                citations = "\n\n---\n\n**출처:**\n"
+                                for i, source in enumerate(citation_sources):
+                                    citations += f"{i+1}. {source.uri}\n"
+
+                        try:
+                            parts = response_text.split('###')
+                            st.session_state.main_business = parts[1].replace('주요 사업', '').strip()
+                            st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
+                            analysis_content = "###" + "###".join(parts[3:])
+                            st.session_state.gemini_analysis = analysis_content + citations
+                        except Exception:
+                            st.session_state.main_business, st.session_state.investment_summary = "-", "-"
+                            st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{response_text}{citations}"
+                    # If it's not a response object, it must be the error string
+                    elif isinstance(response_or_error, str):
+                        st.session_state.gemini_analysis = response_or_error
+                    else:
+                        st.session_state.gemini_analysis = "AI 분석에 실패했습니다. API 호출 중 오류가 발생했거나 응답이 없습니다."
             st.caption(f"AI 분석 호출 (세션): {st.session_state.gemini_api_calls}")
 
         with col2:

@@ -41,7 +41,7 @@ def run_streamlit():
     command = [
         venv_python, "-m", "streamlit", "run", streamlit_script,
         "--server.port=8501",
-        "--server.address=0.0.0.0"
+        # "--server.address=0.0.0.0"
     ]
     print("Running command:", " ".join(command))
     subprocess.run(command, creationflags=subprocess.CREATE_NEW_CONSOLE)
@@ -62,6 +62,6 @@ def run_ollama_backend():
 
 if __name__ == "__main__":
     # update_duckdns()
-    update_github_repo()
+    # update_github_repo()
     run_streamlit()
     # run_ollama_backend()

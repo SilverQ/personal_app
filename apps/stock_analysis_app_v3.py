@@ -579,18 +579,24 @@ def display_candlestick_chart(stock_code, company_name):
                 if has_ohlc:
                     df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
                     fig_daily = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                                              subplot_titles=(daily_title, '거래량', '투자자별 매매동향 (순매수, 백만원)'),
+                                              subplot_titles=(daily_title, '거래량', '투자자별 누적 순매수 동향 (백만원)'),
                                               row_heights=[0.5, 0.2, 0.3])
                     fig_daily.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
                     if 'volume' in df_daily_filtered.columns:
                         colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
                         fig_daily.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
                     if not df_investor.empty and all(c in df_investor.columns for c in ['ind_netprps', 'for_netprps', 'orgn_netprps']):
-                        df_investor_filtered = df_investor[df_investor.index.isin(df_daily_filtered.index)]
-                        fig_daily.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['ind_netprps'], name='개인'), row=3, col=1)
-                        fig_daily.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['for_netprps'], name='외국인'), row=3, col=1)
-                        fig_daily.add_trace(go.Bar(x=df_investor_filtered.index, y=df_investor_filtered['orgn_netprps'], name='기관'), row=3, col=1)
-                        fig_daily.update_layout(barmode='group', yaxis3_title_text='순매수 금액')
+                        df_investor_filtered = df_investor[df_investor.index.isin(df_daily_filtered.index)].copy()
+                        # Calculate cumulative sum
+                        df_investor_filtered['ind_cumulative'] = df_investor_filtered['ind_netprps'].cumsum()
+                        df_investor_filtered['for_cumulative'] = df_investor_filtered['for_netprps'].cumsum()
+                        df_investor_filtered['orgn_cumulative'] = df_investor_filtered['orgn_netprps'].cumsum()
+
+                        # Plot as line chart
+                        fig_daily.add_trace(go.Scatter(x=df_investor_filtered.index, y=df_investor_filtered['ind_cumulative'], mode='lines', name='개인(누적)'), row=3, col=1)
+                        fig_daily.add_trace(go.Scatter(x=df_investor_filtered.index, y=df_investor_filtered['for_cumulative'], mode='lines', name='외국인(누적)'), row=3, col=1)
+                        fig_daily.add_trace(go.Scatter(x=df_investor_filtered.index, y=df_investor_filtered['orgn_cumulative'], mode='lines', name='기관(누적)'), row=3, col=1)
+                        fig_daily.update_layout(yaxis3_title_text='누적 순매수 금액')
                     else:
                         st.warning("투자자별 매매동향 데이터를 차트에 표시할 수 없습니다.")
                 else: # Fallback line chart
@@ -643,6 +649,31 @@ def main():
     st.set_page_config(layout="wide")
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
 
+    # --- CSS Injection for Compact Layout ---
+    st.markdown("""
+        <style>
+            .st-emotion-cache-16txtl3 {padding-top: 1rem;}
+            h1, h2, h3, h4, h5 {
+                margin-top: 0.2rem !important;
+                margin-bottom: 0.2rem !important;
+            }
+            .stApp [data-testid="stVerticalBlock"] > [style*="flex-direction: column;"] > [data-testid="stVerticalBlock"] {
+                gap: 0.5rem;
+            }
+            .st-expander-header {
+                padding-top: 0.5rem !important;
+                padding-bottom: 0.5rem !important;
+            }
+            [data-testid="stMetricValue"] {
+                font-size: 1.2rem;
+            }
+            [data-testid="stMetricLabel"] {
+                 font-size: 0.9rem;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+
     if 'config_manager' not in st.session_state: st.session_state.config_manager = ConfigManager(ROOT_DIR)
     if 'gemini_handler' not in st.session_state: st.session_state.gemini_handler = GeminiAPIHandler(st.session_state.config_manager.get_gemini_keys())
     if 'kiwoom_handler' not in st.session_state:
@@ -650,170 +681,135 @@ def main():
         st.session_state.kiwoom_handler = KiwoomAPIHandler(k_key, k_secret, k_url)
 
     states_to_init = {
-        "gemini_analysis": "상단 설정에서 기업 정보를 입력하고 'Gemini 최신 정보 분석' 버튼을 클릭하여 AI 분석을 시작하세요.",
+        "gemini_analysis": "좌측 설정에서 기업 정보를 입력하고 'AI 분석' 버튼을 클릭하여 분석을 시작하세요.",
         "main_business": "-", "investment_summary": "-", "kiwoom_data": {},
         "df_forecast": get_empty_forecast_df(), "gemini_api_calls": 0,
         "kiwoom_token": None, "kiwoom_token_expires_at": 0,
-        "analyst_model": "Gemini 1.5 Pro" # Add default model name
+        "analyst_model": "Gemini 1.5 Pro"
     }
     for key, value in states_to_init.items():
         if key not in st.session_state: st.session_state[key] = value
 
-    title_col, info_col = st.columns([3, 1])
-    with title_col: st.title("AI 기반 투자 분석 리포트")
-    with info_col: st.markdown(f"<div style='text-align: right;'><b>조회 기준일:</b> {today_str}<br><b>애널리스트:</b> {st.session_state.analyst_model}</div>", unsafe_allow_html=True)
+    st.title("AI 기반 투자 분석 리포트")
+    st.markdown(f"<div style='text-align: right; font-size: 0.9rem;'><b>조회 기준일:</b> {today_str} | <b>애널리스트:</b> {st.session_state.analyst_model}</div>", unsafe_allow_html=True)
     st.divider()
 
-    with st.expander("⚙️ 분석 설정 (기업, 모델 변수 등)", expanded=True):
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            st.markdown("**분석 대상**")
-            df_listing = get_stock_list()
-            if not df_listing.empty:
-                df_listing['display'] = df_listing['name'] + ' (' + df_listing['code'] + ')'
-                stock_options = df_listing['display'].tolist()
-                default_index = stock_options.index("SK하이닉스 (000660)") if "SK하이닉스 (000660)" in stock_options else 0
-                selected_stock = st.selectbox("기업 선택", stock_options, index=default_index, on_change=reset_states_on_stock_change, key='selected_stock', label_visibility="collapsed")
-                company_name, stock_code = re.match(r"(.+) \((.+)\)", selected_stock).groups() if selected_stock else ("", "")
-            else:
-                company_name, stock_code = st.text_input("기업명", "SK하이닉스"), st.text_input("종목코드", "000660")
+    # --- Main 4-Column Layout ---
+    col1, col2, col3, col4 = st.columns(4)
 
-            btn_cols = st.columns(2)
-            if btn_cols[0].button("📈 정보 조회", use_container_width=True):
-                with st.spinner("키움 API에서 최신 정보를 조회 중입니다..."):
-                    kiwoom_data = get_kiwoom_stock_info(stock_code)
-                    if kiwoom_data:
-                        st.session_state.kiwoom_data = kiwoom_data
-                        df_new = st.session_state.df_forecast.copy()
-                        df_new.loc['EPS (원)', '2023A'], df_new.loc['BPS (원)', '2023A'], df_new.loc['ROE (%)', '2023A'] = kiwoom_data.get('eps', 0), kiwoom_data.get('bps', 0), kiwoom_data.get('roe', 0)
-                        st.session_state.df_forecast = df_new
-                        st.success("정보 조회가 완료되었습니다.")
-                    else: st.error("정보 조회에 실패했습니다.")
+    # --- Column 1: Overview & Settings ---
+    with col1:
+        st.markdown("##### 기업 선택 및 조회")
+        df_listing = get_stock_list()
+        if not df_listing.empty:
+            df_listing['display'] = df_listing['name'] + ' (' + df_listing['code'] + ')'
+            stock_options = df_listing['display'].tolist()
+            default_index = stock_options.index("SK하이닉스 (000660)") if "SK하이닉스 (000660)" in stock_options else 0
+            selected_stock = st.selectbox("기업 선택", stock_options, index=default_index, on_change=reset_states_on_stock_change, key='selected_stock', label_visibility="collapsed")
+            company_name, stock_code = re.match(r"(.+) \((.+)\)", selected_stock).groups() if selected_stock else ("", "")
+        else:
+            company_name, stock_code = st.text_input("기업명", "SK하이닉스"), st.text_input("종목코드", "000660")
 
-            if btn_cols[1].button("✨ AI 분석", use_container_width=True):
-                st.session_state.gemini_api_calls += 1
-                with st.spinner('Gemini가 최신 정보를 분석하고 출처를 확인 중입니다...'):
-                    system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 웹 검색 기능을 활용하여 가장 최신 정보와 객관적인 데이터를 찾아 분석에 반영해야 합니다. 주장의 근거가 되는 부분에는 반드시 출처를 `[숫자]` 형식으로 명시해야 합니다. 명확하고 간결하게 핵심을 전달합니다."
-                    user_prompt = f'''**기업 분석 요청**
-- **분석 대상:** {company_name}({stock_code})
-- **요청 사항:**
-  1. **(최신 정보 기반)** 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
-  2. **(최신 정보 기반)** 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
-  3. **(최신 정보 기반)** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
+        btn_cols = st.columns(2)
+        if btn_cols[0].button("📈 정보 조회", use_container_width=True):
+            with st.spinner("API 정보 조회 중..."):
+                kiwoom_data = get_kiwoom_stock_info(stock_code)
+                if kiwoom_data:
+                    st.session_state.kiwoom_data = kiwoom_data
+                    df_new = st.session_state.df_forecast.copy()
+                    df_new.loc['EPS (원)', '2023A'], df_new.loc['BPS (원)', '2023A'], df_new.loc['ROE (%)', '2023A'] = kiwoom_data.get('eps', 0), kiwoom_data.get('bps', 0), kiwoom_data.get('roe', 0)
+                    st.session_state.df_forecast = df_new
+                else: st.error("정보 조회 실패")
 
-**[결과 출력 형식]**
-### 주요 사업
-[내용]
+        if btn_cols[1].button("✨ AI 분석", use_container_width=True):
+            st.session_state.gemini_api_calls += 1
+            with st.spinner('Gemini가 분석 중입니다...'):
+                system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 웹 검색 기능을 활용하여 가장 최신 정보와 객관적인 데이터를 찾아 분석에 반영해야 합니다. 주장의 근거가 되는 부분에는 반드시 출처를 `[숫자]` 형식으로 명시해야 합니다. 명확하고 간결하게 핵심을 전달합니다."
+                user_prompt = f'''**기업 분석 요청**\n- **분석 대상:** {company_name}({stock_code})\n- **요청 사항:**\n  1. **(최신 정보 기반)** 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.\n  2. **(최신 정보 기반)** 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.\n  3. **(최신 정보 기반)** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.\n\n**[결과 출력 형식]**\n### 주요 사업\n[내용]\n\n### 핵심 투자 요약\n[내용]\n\n### 긍정적 투자 포인트\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]\n\n### 잠재적 리스크 요인\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]'''
+                response_or_error = generate_gemini_content(user_prompt, system_prompt)
+                if hasattr(response_or_error, 'text'):
+                    full_response_obj = response_or_error
+                    response_text = full_response_obj.text
+                    citations = ""
+                    if hasattr(full_response_obj, 'citation_metadata') and full_response_obj.citation_metadata and full_response_obj.citation_metadata.citation_sources:
+                        citations = "\n\n---\n\n**출처:**\n" + "\n".join(f"{i+1}. {source.uri}" for i, source in enumerate(full_response_obj.citation_metadata.citation_sources))
+                    try:
+                        parts = response_text.split('###')
+                        st.session_state.main_business = parts[1].replace('주요 사업', '').strip()
+                        st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
+                        st.session_state.gemini_analysis = "###" + "###".join(parts[3:]) + citations
+                    except Exception:
+                        st.session_state.main_business, st.session_state.investment_summary = "-", "-"
+                        st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{response_text}{citations}"
+                elif isinstance(response_or_error, str):
+                    st.session_state.gemini_analysis = response_or_error
+                else:
+                    st.session_state.gemini_analysis = "AI 분석에 실패했습니다."
+        
+        st.caption(f"AI 분석 호출 (세션): {st.session_state.gemini_api_calls}")
+        
+        with st.container(border=True):
+            st.markdown("##### 기업 개요")
+            market_cap = st.session_state.kiwoom_data.get('market_cap', 0)
+            st.markdown(f"""
+            - **시가총액**: {market_cap / 100000000:,.0f} 억원
+            - **PER / PBR**: {st.session_state.kiwoom_data.get('per', 0):.2f} 배 / {st.session_state.kiwoom_data.get('pbr', 0):.2f} 배
+            - **52주 최고/최저**: {st.session_state.kiwoom_data.get('high_52w', 0):,.0f} / {st.session_state.kiwoom_data.get('low_52w', 0):,.0f} 원
+            """)
 
-### 핵심 투자 요약
-[내용]
+    # --- Column 2: Core AI Analysis & Opinion ---
+    with col2:
+        st.markdown("##### AI 요약 및 투자의견")
+        current_price = st.session_state.kiwoom_data.get('price', 0)
+        # Read slider values from session_state to ensure immediate update
+        est_roe = st.session_state.get('est_roe_slider', st.session_state.kiwoom_data.get('roe', 10.0))
+        cost_of_equity = st.session_state.get('cost_of_equity_slider', 9.0)
+        terminal_growth = st.session_state.get('terminal_growth_slider', 3.0)
+        est_bps = st.session_state.get('est_bps_input', int(st.session_state.kiwoom_data.get('bps', 150000)))
+        
+        target_pbr = ValuationCalculator.calculate_target_pbr(est_roe, cost_of_equity, terminal_growth)
+        calculated_target_price = ValuationCalculator.calculate_target_price(target_pbr, est_bps)
+        investment_opinion, upside_potential = ValuationCalculator.get_investment_opinion(current_price, calculated_target_price)
 
-### 긍정적 투자 포인트
-**1. [제목]**
-- [근거]
-**2. [제목]**
-- [근거]
+        m_cols = st.columns(2)
+        m_cols[0].metric("투자의견", investment_opinion)
+        m_cols[1].metric("상승여력", f"{upside_potential:.2f} %")
+        m_cols[0].metric("현재주가", f"{current_price:,.0f} 원" if current_price else "N/A")
+        m_cols[1].metric("목표주가", f"{calculated_target_price:,.0f} 원")
 
-### 잠재적 리스크 요인
-**1. [제목]**
-- [근거]
-**2. [제목]**
-- [근거]'''
-                    response_or_error = generate_gemini_content(user_prompt, system_prompt)
+        with st.container(border=True, height=300):
+            st.markdown("##### 주요 사업")
+            st.markdown(st.session_state.main_business)
+            st.markdown("---")
+            st.markdown("##### 핵심 투자 요약")
+            st.markdown(st.session_state.investment_summary)
 
-                    # Check if the response is successful by checking for the .text attribute
-                    if hasattr(response_or_error, 'text'):
-                        full_response_obj = response_or_error
-                        response_text = full_response_obj.text
-                        citations = ""
-                        if hasattr(full_response_obj, 'citation_metadata') and full_response_obj.citation_metadata:
-                            citation_sources = full_response_obj.citation_metadata.citation_sources
-                            if citation_sources:
-                                citations = "\n\n---\n\n**출처:**\n"
-                                for i, source in enumerate(citation_sources):
-                                    citations += f"{i+1}. {source.uri}\n"
+    # --- Column 3: Valuation & Earnings ---
+    with col3:
+        st.markdown("##### 가치평가 및 실적")
+        with st.container(border=True):
+            st.slider("예상 ROE (%)", 0.0, 50.0, st.session_state.kiwoom_data.get('roe', 10.0), 0.1, key="est_roe_slider")
+            st.slider("자기자본비용 (Ke, %)", 5.0, 15.0, 9.0, 0.1, key="cost_of_equity_slider")
+            st.slider("영구성장률 (g, %)", 0.0, 5.0, 3.0, 0.1, key="terminal_growth_slider")
+            st.number_input("예상 BPS (원)", value=int(st.session_state.kiwoom_data.get('bps', 150000)), key="est_bps_input")
+            st.success(f"**목표 PBR:** `{target_pbr:.2f}` 배 | **목표주가:** `{calculated_target_price:,.0f}` 원")
 
-                        try:
-                            parts = response_text.split('###')
-                            st.session_state.main_business = parts[1].replace('주요 사업', '').strip()
-                            st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
-                            analysis_content = "###" + "###".join(parts[3:])
-                            st.session_state.gemini_analysis = analysis_content + citations
-                        except Exception:
-                            st.session_state.main_business, st.session_state.investment_summary = "-", "-"
-                            st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{response_text}{citations}"
-                    # If it's not a response object, it must be the error string
-                    elif isinstance(response_or_error, str):
-                        st.session_state.gemini_analysis = response_or_error
-                    else:
-                        st.session_state.gemini_analysis = "AI 분석에 실패했습니다. API 호출 중 오류가 발생했거나 응답이 없습니다."
-            st.caption(f"AI 분석 호출 (세션): {st.session_state.gemini_api_calls}")
+        st.markdown("##### 실적 전망 (단위: 십억원)")
+        st.session_state.df_forecast = st.data_editor(st.session_state.df_forecast, use_container_width=True, height=240)
 
-        with col2:
-            st.markdown("**가치평가 모델**")
-            est_roe = st.slider("예상 ROE (%)", 0.0, 50.0, st.session_state.kiwoom_data.get('roe', 10.0), 0.1)
-            cost_of_equity = st.slider("자기자본비용 (Ke, %)", 5.0, 15.0, 9.0, 0.1)
-            terminal_growth = st.slider("영구성장률 (g, %)", 0.0, 5.0, 3.0, 0.1)
-        with col3:
-            st.markdown("**목표주가 변수**")
-            est_bps = st.number_input("예상 BPS (원)", value=int(st.session_state.kiwoom_data.get('bps', 150000)))
+    # --- Column 4: Detailed AI Analysis ---
+    with col4:
+        st.markdown("##### Gemini 세부 분석")
+        with st.container(border=True, height=550):
+            st.markdown(st.session_state.gemini_analysis)
 
-    target_pbr = ValuationCalculator.calculate_target_pbr(est_roe, cost_of_equity, terminal_growth)
-    calculated_target_price = ValuationCalculator.calculate_target_price(target_pbr, est_bps)
-    current_price = st.session_state.kiwoom_data.get('price', 0)
-    investment_opinion, upside_potential = ValuationCalculator.get_investment_opinion(current_price, calculated_target_price)
     st.divider()
 
-    st.header("1. 요약 (Executive Summary)")
-    summary_cols = st.columns(4)
-    summary_cols[0].metric("투자의견", investment_opinion)
-    summary_cols[1].metric("현재주가", f"{current_price:,.0f} 원" if current_price else "N/A")
-    summary_cols[2].metric("목표주가", f"{calculated_target_price:,.0f} 원")
-    summary_cols[3].metric("상승여력", f"{upside_potential:.2f} %")
-    st.info(f"**핵심 투자 요약:**\n\n> {st.session_state.investment_summary}")
-    st.divider()
-
-    main_col1, main_col2 = st.columns(2)
-    with main_col1:
-        st.subheader("2. 기업 개요")
-        market_cap = st.session_state.kiwoom_data.get('market_cap', 0)
-        st.text_input("회사명", company_name, disabled=True)
-        st.text_input("티커", stock_code, disabled=True)
-        st.text_area("주요 사업", st.session_state.main_business, disabled=True)
-        st.text_input("시가총액", f"{market_cap / 100000000:,.0f} 억원" if market_cap > 0 else "N/A", disabled=True)
-        overview_cols = st.columns(2)
-        overview_cols[0].metric("PER", f"{st.session_state.kiwoom_data.get('per', 0):.2f} 배")
-        overview_cols[1].metric("PBR", f"{st.session_state.kiwoom_data.get('pbr', 0):.2f} 배")
-        overview_cols[0].metric("52주 최고", f"{st.session_state.kiwoom_data.get('high_52w', 0):,.0f} 원")
-        overview_cols[1].metric("52주 최저", f"{st.session_state.kiwoom_data.get('low_52w', 0):,.0f} 원")
-    with main_col2:
-        st.subheader("3. Gemini 종합 분석")
-        with st.container(border=True): st.markdown(st.session_state.gemini_analysis)
-    st.divider()
-
-    st.header("4. 실적 전망 (Earnings Forecast)")
-    st.caption("아래 표의 데이터를 직접 수정하여 목표주가 계산에 실시간으로 반영할 수 있습니다.")
-    st.session_state.df_forecast = st.data_editor(st.session_state.df_forecast, use_container_width=True)
-    st.divider()
-
-    st.header("5. 가치평가 (Valuation)")
-    val_col1, val_col2 = st.columns(2)
-    with val_col1:
-        st.markdown(f"- **(A) 예상 ROE:** `{est_roe:.2f} %`")
-        st.markdown(f"- **(B) 자기자본비용 (Ke):** `{cost_of_equity:.2f} %`")
-        st.markdown(f"- **(C) 영구성장률 (g):** `{terminal_growth:.2f} %`")
-    with val_col2: st.success(f"**목표 PBR (배):** `{target_pbr:.2f}` 배")
-    st.subheader("5.2. 목표주가 산출")
-    val2_col1, val2_col2 = st.columns(2)
-    with val2_col1:
-        st.markdown(f"- **(D) 목표 PBR:** `{target_pbr:.2f}` 배")
-        st.markdown(f"- **(E) 예상 BPS:** `{est_bps:,.0f}` 원")
-    with val2_col2: st.success(f"**목표주가 (원):** `{calculated_target_price:,.0f}` 원")
-    st.divider()
-
+    # --- Bottom Chart Area ---
     st.header("6. 주가 차트 (Stock Chart)")
     if st.button("📊 주가 & 투자자 동향 차트 생성", help="키움 API를 통해 일봉, 주봉, 월봉 및 투자자별 동향 차트를 조회합니다.", use_container_width=True):
         display_candlestick_chart(stock_code, company_name)
+    
     st.divider()
     st.write("*본 보고서는 외부 출처로부터 얻은 정보에 기반하며, 정확성을 보장하지 않습니다. 투자 결정에 대한 최종 책임은 투자자 본인에게 있습니다.*")
 

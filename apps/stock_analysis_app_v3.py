@@ -545,6 +545,8 @@ def reset_states_on_stock_change():
     st.session_state.investment_summary = "-"
     st.session_state.kiwoom_data = {}
     st.session_state.df_forecast = get_empty_forecast_df()
+    st.session_state.master_analysis_results = []
+    st.session_state.full_gemini_prompt = ""
 
 # --- Plotting Functions ---
 
@@ -685,7 +687,9 @@ def main():
         "main_business": "-", "investment_summary": "-", "kiwoom_data": {},
         "df_forecast": get_empty_forecast_df(), "gemini_api_calls": 0,
         "kiwoom_token": None, "kiwoom_token_expires_at": 0,
-        "analyst_model": "Gemini 1.5 Pro"
+        "analyst_model": "Gemini 1.5 Pro",
+        "master_analysis_results": [], # 대가별 분석 결과를 저장할 리스트
+        "full_gemini_prompt": "" # 전송된 전체 프롬프트를 저장
     }
     for key, value in states_to_init.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -695,7 +699,7 @@ def main():
     st.divider()
 
     # --- Main 4-Column Layout ---
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1.5])
 
     # --- Column 1: Overview & Settings ---
     with col1:
@@ -725,7 +729,56 @@ def main():
             st.session_state.gemini_api_calls += 1
             with st.spinner('Gemini가 분석 중입니다...'):
                 system_prompt = "당신은 15년 경력의 유능한 대한민국 주식 전문 애널리스트입니다. 웹 검색 기능을 활용하여 가장 최신 정보와 객관적인 데이터를 찾아 분석에 반영해야 합니다. 주장의 근거가 되는 부분에는 반드시 출처를 `[숫자]` 형식으로 명시해야 합니다. 명확하고 간결하게 핵심을 전달합니다."
-                user_prompt = f'''**기업 분석 요청**\n- **분석 대상:** {company_name}({stock_code})\n- **요청 사항:**\n  1. **(최신 정보 기반)** 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.\n  2. **(최신 정보 기반)** 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.\n  3. **(최신 정보 기반)** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.\n\n**[결과 출력 형식]**\n### 주요 사업\n[내용]\n\n### 핵심 투자 요약\n[내용]\n\n### 긍정적 투자 포인트\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]\n\n### 잠재적 리스크 요인\n**1. [제목]**\n- [근거]\n**2. [제목]**\n- [근거]'''
+                # 대가별 심층 분석 질문들을 포함한 확장된 프롬프트
+                user_prompt = f'''**기업 분석 요청**
+- **분석 대상:** {company_name}({stock_code})
+- **요청 사항:**
+  1. **(최신 정보 기반)** 이 기업의 **주요 사업**에 대해 한국어로 2-3문장으로 요약해주세요.
+  2. **(최신 정보 기반)** 이 기업에 대한 **핵심 투자 요약**을 강점과 약점을 포함하여 한국어로 3줄 이내로 작성해주세요.
+  3. **(최신 정보 기반)** 최근 6개월간의 정보를 종합하여, 아래 형식에 맞춰 '긍정적 투자 포인트' 2가지와 '잠재적 리스크 요인' 2가지를 구체적인 근거와 함께 한국어로 도출해주세요.
+  4. **(워런 버핏 - 경제적 해자)** 분석 대상 기업의 **경제적 해자**는 무엇이며, 경쟁사 대비 얼마나 강력합니까?
+  5. **(워런 버핏 - 경영진 평가)** 현재 **경영진의 능력과 평판**은 어떻습니까? 최근 주요 의사결정은 무엇이었나요?
+  6. **(윌리엄 오닐 - 산업 내 리더십)** 이 기업은 **산업 내 주도주**입니까, 아니면 후발주자입니까? 시장 점유율과 기술력 측면에서 비교해주세요.
+  7. **(조지 소로스/레이 달리오 - 거시 경제 영향)** 현재 **금리, 환율 등 거시 경제 상황**이 이 기업에 미칠 긍정적/부정적 영향은 무엇입니까?
+
+**[결과 출력 형식]**
+### 주요 사업
+[내용]
+
+### 핵심 투자 요약
+[내용]
+
+### 긍정적 투자 포인트
+**1. [제목]**
+- [근거]
+**2. [제목]**
+- [근거]
+
+### 잠재적 리스크 요인
+**1. [제목]**
+- [근거]
+**2. [제목]**
+- [근거]
+
+### 대가별 심층 분석 시작
+#### 워런 버핏 - 경제적 해자
+**질문:** 분석 대상 기업의 경제적 해자는 무엇이며, 경쟁사 대비 얼마나 강력합니까?
+**답변:** [AI 분석 결과]
+
+#### 워런 버핏 - 경영진 평가
+**질문:** 현재 경영진의 능력과 평판은 어떻습니까? 최근 주요 의사결정은 무엇이었나요?
+**답변:** [AI 분석 결과]
+
+#### 윌리엄 오닐 - 산업 내 리더십
+**질문:** 이 기업은 산업 내 주도주입니까, 아니면 후발주자입니까? 시장 점유율과 기술력 측면에서 비교해주세요.
+**답변:** [AI 분석 결과]
+
+#### 조지 소로스/레이 달리오 - 거시 경제 영향
+**질문:** 현재 금리, 환율 등 거시 경제 상황이 이 기업에 미칠 긍정적/부정적 영향은 무엇입니까?
+**답변:** [AI 분석 결과]
+'''
+                st.session_state.full_gemini_prompt = user_prompt  # 전체 프롬프트 저장
+
                 response_or_error = generate_gemini_content(user_prompt, system_prompt)
                 if hasattr(response_or_error, 'text'):
                     full_response_obj = response_or_error
@@ -734,18 +787,54 @@ def main():
                     if hasattr(full_response_obj, 'citation_metadata') and full_response_obj.citation_metadata and full_response_obj.citation_metadata.citation_sources:
                         citations = "\n\n---\n\n**출처:**\n" + "\n".join(f"{i+1}. {source.uri}" for i, source in enumerate(full_response_obj.citation_metadata.citation_sources))
                     try:
-                        parts = response_text.split('###')
-                        st.session_state.main_business = parts[1].replace('주요 사업', '').strip()
-                        st.session_state.investment_summary = parts[2].replace('핵심 투자 요약', '').strip()
-                        st.session_state.gemini_analysis = "###" + "###".join(parts[3:]) + citations
-                    except Exception:
+                        # 주요 사업, 핵심 투자 요약 파싱
+                        main_business_match = re.search(r'### 주요 사업\n(.*?)(?=\n###)', response_text, re.DOTALL)
+                        investment_summary_match = re.search(r'### 핵심 투자 요약\n(.*?)(?=\n###)', response_text, re.DOTALL)
+
+                        st.session_state.main_business = main_business_match.group(
+                            1).strip() if main_business_match else "-"
+                        st.session_state.investment_summary = investment_summary_match.group(
+                            1).strip() if investment_summary_match else "-"
+
+                        # 긍정적 투자 포인트, 잠재적 리스크 요인 파싱 (일반 분석)
+                        general_analysis_match = re.search(r'(### 긍정적 투자 포인트.*?)(?=\n### 대가별 심층 분석 시작)', response_text,
+                                                           re.DOTALL)
+                        st.session_state.gemini_analysis = general_analysis_match.group(
+                            1).strip() + citations if general_analysis_match else "일반 분석 파싱 실패" + citations
+
+                        # 대가별 심층 분석 파싱
+                        master_analysis_section_match = re.search(r'### 대가별 심층 분석 시작\n(.*)', response_text, re.DOTALL)
+                        if master_analysis_section_match:
+                            master_analysis_text = master_analysis_section_match.group(1)
+                            # 각 대가별 분석 블록을 정규식으로 찾기
+                            master_blocks = re.findall(r'#### (.+?)\n\*\*질문:\*\*(.+?)\n\*\*답변:\*\*(.+?)(?=\n####|\Z)',
+                                                       master_analysis_text, re.DOTALL)
+
+                            st.session_state.master_analysis_results = []
+                            for block in master_blocks:
+                                master_concept = block[0].strip()
+                                question = block[1].strip()
+                                answer = block[2].strip()
+                                st.session_state.master_analysis_results.append({
+                                    'master_concept': master_concept,
+                                    'question': question,
+                                    'answer': answer
+                                })
+                        else:
+                            st.session_state.master_analysis_results = []
+                            st.error("대가별 심층 분석 섹션을 찾을 수 없습니다.")
+
+                    except Exception as e:
                         st.session_state.main_business, st.session_state.investment_summary = "-", "-"
-                        st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{response_text}{citations}"
+                        st.session_state.gemini_analysis = f"**오류: Gemini 응답 처리 중 문제가 발생했습니다.**\n\n{response_text}{citations}\n\n**파싱 오류:** {e}"
+                        st.session_state.master_analysis_results = []
                 elif isinstance(response_or_error, str):
                     st.session_state.gemini_analysis = response_or_error
+                    st.session_state.master_analysis_results = []
                 else:
                     st.session_state.gemini_analysis = "AI 분석에 실패했습니다."
-        
+                    st.session_state.master_analysis_results = []
+
         st.caption(f"AI 분석 호출 (세션): {st.session_state.gemini_api_calls}")
         
         with st.container(border=True):
@@ -801,7 +890,21 @@ def main():
     with col4:
         st.markdown("##### Gemini 세부 분석")
         with st.container(border=True, height=550):
-            st.markdown(st.session_state.gemini_analysis)
+            st.markdown(st.session_state.gemini_analysis)  # 일반 분석 결과 표시
+
+            if st.session_state.master_analysis_results:
+                st.markdown("---")
+                st.markdown("##### 대가별 심층 분석")
+                for item in st.session_state.master_analysis_results:
+                    with st.expander(f"**{item['master_concept']}**"):
+                        st.markdown(f"**질문:** {item['question']}")
+                        st.markdown(f"**답변:** {item['answer']}")
+
+            # 전체 프롬프트 표시
+            if st.session_state.full_gemini_prompt:
+                st.markdown("---")
+                with st.expander("Gemini 프롬프트 확인"):
+                    st.code(st.session_state.full_gemini_prompt, language='markdown')
 
     st.divider()
 

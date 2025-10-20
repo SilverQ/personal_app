@@ -262,14 +262,24 @@ class KiwoomAPIHandler:
                 return {}
 
             def clean_value(value_str):
-                if isinstance(value_str, str) and value_str:
-                    try:
-                        return float(value_str.replace('+', '').replace('-', ''))
-                    except ValueError:
+                """Convert API numeric string to float safely.
+                - Preserve '-' sign, strip leading '+'
+                - Remove thousand separators and percent symbols
+                - Fallback to 0.0 if conversion fails
+                """
+                try:
+                    s = str(value_str).strip()
+                    if not s:
                         return 0.0
-                elif isinstance(value_str, (int, float)):
-                    return float(value_str)
-                return 0.0
+                    s = s.replace(',', '').replace('%', '')
+                    if s.startswith('+'):
+                        s = s[1:]
+                    return float(s)
+                except Exception:
+                    try:
+                        return float(value_str)
+                    except Exception:
+                        return 0.0
 
             info = {
                 'price': clean_value(data.get('cur_prc', 0)),
@@ -497,8 +507,16 @@ class KiwoomAPIHandler:
 class ValuationCalculator:
     @staticmethod
     def calculate_target_pbr(roe, cost_of_equity, terminal_growth):
+        """Justified PBR with guards: PBR = (ROE - g) / (Ke - g).
+        If Ke <= g, or result < 0, return 0.0 to avoid nonsensical values.
+        Inputs are percent.
+        """
         roe_pct, ke_pct, g_pct = roe / 100, cost_of_equity / 100, terminal_growth / 100
-        return (roe_pct - g_pct) / (ke_pct - g_pct) if (ke_pct - g_pct) != 0 else 0
+        denom = ke_pct - g_pct
+        if denom <= 0:
+            return 0.0
+        pbr = (roe_pct - g_pct) / denom
+        return pbr if pbr > 0 else 0.0
 
     @staticmethod
     def calculate_target_price(target_pbr, bps):
@@ -550,6 +568,15 @@ def reset_states_on_stock_change():
     st.session_state.df_forecast = get_empty_forecast_df()
     st.session_state.master_analysis_results = []
     st.session_state.full_gemini_prompt = ""
+    # Reset valuation widgets so new company defaults apply
+    for key in (
+        'est_bps_input',
+        'est_roe_slider',
+        'cost_of_equity_slider',
+        'terminal_growth_slider',
+    ):
+        if key in st.session_state:
+            del st.session_state[key]
 
 # --- Plotting Functions ---
 
@@ -726,6 +753,15 @@ def main():
                     df_new = st.session_state.df_forecast.copy()
                     df_new.loc['EPS (원)', '2023A'], df_new.loc['BPS (원)', '2023A'], df_new.loc['ROE (%)', '2023A'] = kiwoom_data.get('eps', 0), kiwoom_data.get('bps', 0), kiwoom_data.get('roe', 0)
                     st.session_state.df_forecast = df_new
+                    # Ensure valuation widgets reflect latest fetched values
+                    try:
+                        st.session_state['est_bps_input'] = int(float(kiwoom_data.get('bps', 0)))
+                    except Exception:
+                        st.session_state['est_bps_input'] = int(kiwoom_data.get('bps', 0) or 0)
+                    try:
+                        st.session_state['est_roe_slider'] = float(kiwoom_data.get('roe', 0))
+                    except Exception:
+                        st.session_state['est_roe_slider'] = kiwoom_data.get('roe', 0) or 0.0
                 else: st.error("정보 조회 실패")
 
         if btn_cols[1].button("✨ AI 분석", use_container_width=True):
@@ -843,11 +879,39 @@ def main():
         with st.container(border=True):
             st.markdown("##### 기업 개요")
             market_cap = st.session_state.kiwoom_data.get('market_cap', 0)
-            st.markdown(f"""
+        st.markdown(f"""
             - **시가총액**: {market_cap / 100000000:,.0f} 억원
             - **PER / PBR**: {st.session_state.kiwoom_data.get('per', 0):.2f} 배 / {st.session_state.kiwoom_data.get('pbr', 0):.2f} 배
             - **52주 최고/최저**: {st.session_state.kiwoom_data.get('high_52w', 0):,.0f} / {st.session_state.kiwoom_data.get('low_52w', 0):,.0f} 원
             """)
+
+        # 최소 조치: 현재 사용되는 지표/멀티플 진단 패널
+        with st.expander("진단: 가격·BPS·PBR 일관성", expanded=False):
+            k = st.session_state.kiwoom_data
+            price = float(k.get('price', 0) or 0)
+            bps = float(k.get('bps', 0) or 0)
+            pbr = float(k.get('pbr', 0) or 0)
+
+            market_pbr_from_price = (price / bps) if bps else 0.0
+            price_from_bps_pbr = (bps * pbr) if bps else 0.0
+
+            # 현재 입력(가정) 기반 목표 PBR/목표주가
+            est_roe = float(st.session_state.get('est_roe_slider', k.get('roe', 0) or 0.0))
+            cost_of_equity = float(st.session_state.get('cost_of_equity_slider', 9.0))
+            terminal_growth = float(st.session_state.get('terminal_growth_slider', 3.0))
+            est_bps = float(st.session_state.get('est_bps_input', k.get('bps', 0) or 0.0))
+            target_pbr = ValuationCalculator.calculate_target_pbr(est_roe, cost_of_equity, terminal_growth)
+            target_price = ValuationCalculator.calculate_target_price(target_pbr, est_bps)
+
+            st.markdown(
+                f"- 사용 중 주가(price): `{price:,.0f}` 원\n"
+                f"- 사용 중 BPS: `{bps:,.0f}` 원\n"
+                f"- 사용 중 PBR(응답): `{pbr:.2f}` 배\n"
+                f"- 계산된 PBR(= price/BPS): `{market_pbr_from_price:.2f}` 배\n"
+                f"- BPS×PBR로 재계산한 가격: `{price_from_bps_pbr:,.0f}` 원\n"
+                f"- 목표 PBR(가정 기반): `{target_pbr:.2f}` 배\n"
+                f"- 목표주가(= 목표PBR×BPS 가정): `{target_price:,.0f}` 원"
+            )
 
     # --- Column 2: Core AI Analysis & Opinion ---
     with col2:

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 from google import genai
@@ -59,8 +60,9 @@ class GeminiAPIHandler:
         self.api_keys = api_keys
         self.current_key_index = 0
         self.client = None
-        self.primary_model = 'gemini-1.5-pro'
-        self.fallback_model = 'gemini-1.5-flash'
+        # Prefer broadly available v1 models by default
+        self.primary_model = 'gemini-2.0-flash'
+        self.fallback_model = 'gemini-2.5-flash'
 
         if not self.api_keys:
             st.warning("Gemini API 키를 찾을 수 없어 AI 분석 기능이 제한됩니다. 환경 변수 또는 config.ini 파일을 확인해주세요.")
@@ -72,7 +74,7 @@ class GeminiAPIHandler:
         if self.current_key_index < len(self.api_keys):
             current_key = self.api_keys[self.current_key_index]
             try:
-                self.client = genai.Client(api_key=current_key)
+                self.client = genai.Client(api_key=current_key, http_options={"api_version": "v1"})
                 # st.info(f"Gemini 클라이언트를 API Key #{self.current_key_index + 1}로 초기화했습니다.")
                 return True
             except Exception as e:
@@ -105,10 +107,11 @@ class GeminiAPIHandler:
             return "오류: Gemini API 키가 설정되지 않았습니다."
 
         from google.api_core.exceptions import ResourceExhausted
-        from google.genai.types import GenerateContentConfig, Tool
+        from google.genai.types import GenerateContentConfig
 
         full_prompt = f"{system_instruction}\n\n{prompt}"
-        config = GenerateContentConfig(tools=[Tool(google_search_retrieval={})])
+        # Minimal config: remove tool usage to avoid INVALID_ARGUMENT on v1
+        config = None
 
         # Store the starting key index for this request
         start_index = self.current_key_index
@@ -121,10 +124,10 @@ class GeminiAPIHandler:
 
             # 1. Try with the primary model (Pro)
             try:
-                st.session_state.analyst_model = "Gemini 1.5 Pro"
+                st.session_state.analyst_model = self.primary_model
                 st.info(f"API Key #{self.current_key_index + 1}을(를) 사용하여 '{st.session_state.analyst_model}' 모델로 분석을 시도합니다.")
                 response = self.client.models.generate_content(
-                    model=f'models/{self.primary_model}',
+                    model=self.primary_model,
                     contents=full_prompt,
                     config=config
                 )
@@ -133,10 +136,10 @@ class GeminiAPIHandler:
                 st.warning(f"Key #{self.current_key_index + 1}의 '{self.primary_model}' 모델 사용량이 소진되었습니다. 폴백 모델로 전환합니다.")
                 # 2. If exhausted, try with the fallback model (Flash) with the SAME key
                 try:
-                    st.session_state.analyst_model = "Gemini 1.5 Flash"
+                    st.session_state.analyst_model = self.fallback_model
                     st.info(f"동일한 API Key #{self.current_key_index + 1}을(를) 사용하여 '{st.session_state.analyst_model}' 모델로 재시도합니다.")
                     response = self.client.models.generate_content(
-                        model=f'models/{self.fallback_model}',
+                        model=self.fallback_model,
                         contents=full_prompt,
                         config=config
                     )

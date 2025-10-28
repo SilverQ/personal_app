@@ -12,10 +12,97 @@ import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.io as pio
+from PIL import Image
+from io import BytesIO
 
 # --- Constants and Paths ---
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(APP_DIR)
+
+# --- Utility: Save charts as JPG ---
+def _safe_filename(name: str) -> str:
+    try:
+        s = str(name)
+    except Exception:
+        s = "chart"
+    # Remove characters illegal on Windows and normalize spaces
+    s = re.sub(r'[\\/:*?"<>|]', '', s)
+    s = s.strip().replace(' ', '_')
+    return s or 'chart'
+
+def save_plotly_fig_as_jpg(fig, out_path, width=1200, height=800, scale=2):
+    try:
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        # Requires kaleido
+        pio.write_image(fig, out_path, format='jpg', engine='kaleido', width=width, height=height, scale=scale)
+        return True, out_path
+    except Exception as e:
+        st.error(f"차트 저장 실패: {e}")
+        st.info("이미지 저장을 위해 'kaleido' 패키지가 필요합니다. 설치: pip install -U kaleido")
+        return False, str(e)
+
+def save_combined_charts_as_jpg(fig_daily, fig_weekly, fig_monthly, out_path,
+                                size=1400, top_ratio=0.62,
+                                scale=1, bg_color=(255,255,255)):
+    try:
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        # Target square canvas
+        size = int(size)
+        top_ratio = float(top_ratio)
+        daily_h = max(300, int(size * top_ratio))
+        bottom_h = max(300, size - daily_h)
+        left_w = size
+        right_w_each = size // 2
+        # Make safe copies for export and adjust margins to avoid clipping
+        fd = go.Figure(fig_daily)
+        fw = go.Figure(fig_weekly)
+        fm = go.Figure(fig_monthly)
+        export_margin = dict(l=60, r=30, b=50, t=60)
+        fd.update_layout(margin=export_margin)
+        fw.update_layout(margin=export_margin)
+        fm.update_layout(margin=export_margin)
+        
+        def _render_bytes(fig, w, h, sc):
+            # Try JPG first, then fallback to PNG
+            try:
+                return pio.to_image(fig, format='jpg', engine='kaleido', width=w, height=h, scale=sc)
+            except Exception:
+                return pio.to_image(fig, format='png', engine='kaleido', width=w, height=h, scale=max(1, sc))
+
+        # Render figures to images (bytes) using kaleido, sized to fit square layout
+        try:
+            img_daily_b = _render_bytes(fd, left_w, daily_h, scale)
+            img_weekly_b = _render_bytes(fw, right_w_each, bottom_h, scale)
+            img_monthly_b = _render_bytes(fm, right_w_each, bottom_h, scale)
+        except Exception:
+            # Fallback: reduce size/scale and retry once
+            img_daily_b = _render_bytes(fd, left_w//2, daily_h//2, 1)
+            img_weekly_b = _render_bytes(fw, right_w_each//2, bottom_h//2, 1)
+            img_monthly_b = _render_bytes(fm, right_w_each//2, bottom_h//2, 1)
+
+        img_daily = Image.open(BytesIO(img_daily_b)).convert('RGB')
+        img_weekly = Image.open(BytesIO(img_weekly_b)).convert('RGB')
+        img_monthly = Image.open(BytesIO(img_monthly_b)).convert('RGB')
+
+        # Square canvas (W x W)
+        canvas = Image.new('RGB', (size, size), color=bg_color)
+        # Paste: daily spans full top row; weekly bottom-left; monthly bottom-right
+        canvas.paste(img_daily, (0, 0))
+        canvas.paste(img_weekly, (0, daily_h))
+        canvas.paste(img_monthly, (right_w_each, daily_h))
+
+        canvas.save(out_path, format='JPEG', quality=90)
+        return True, out_path
+    except Exception as e:
+        st.error(f"통합 차트 저장 실패: {e}")
+        st.info("이미지 저장을 위해 'kaleido'와 'pillow' 패키지가 필요합니다. 설치: pip install -U kaleido pillow")
+        return False, str(e)
 
 # --- Object-Oriented Handlers ---
 
@@ -581,6 +668,11 @@ def reset_states_on_stock_change():
 # --- Plotting Functions ---
 
 def display_candlestick_chart(stock_code, company_name):
+    # Remember selection and keep charts visible across reruns
+    st.session_state['_charts_rendered_this_run'] = True
+    st.session_state['show_charts'] = True
+    st.session_state['last_stock_code'] = stock_code
+    st.session_state['last_company_name'] = company_name
     if 'kiwoom_handler' not in st.session_state:
         st.error("차트를 생성하려면 Kiwoom 핸들러가 필요합니다.")
         return
@@ -642,7 +734,18 @@ def display_candlestick_chart(stock_code, company_name):
                 if fig_daily:
                     fig_daily.update_xaxes(rangebreaks=rangebreaks)
                     fig_daily.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=600, margin=dict(l=10, r=10, b=10, t=40))
+                    fig_daily.update_layout(legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.6)', bordercolor='rgba(0,0,0,0.1)', borderwidth=1, font=dict(size=10)))
+                    # Colorize investor cumulative lines (last 3 traces)
+                    try:
+                        tr_ind, tr_for, tr_org = fig_daily.data[-3], fig_daily.data[-2], fig_daily.data[-1]
+                        tr_ind.update(line=dict(color='#2ca02c', width=2), name='개인(누적)')
+                        tr_for.update(line=dict(color='#1f77b4', width=2), name='외국인(누적)')
+                        tr_org.update(line=dict(color='#ff7f0e', width=2, dash='dash'), name='기관(누적)')
+                    except Exception:
+                        pass
                     st.plotly_chart(fig_daily, use_container_width=True)
+                    # Keep reference for combined export
+                    st.session_state._last_fig_daily = fig_daily
 
         with col2:
             st.subheader("주봉 & 월봉")
@@ -652,7 +755,7 @@ def display_candlestick_chart(stock_code, company_name):
                 '월봉 (3년)': (df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))], 300)
             }
 
-            for title, (df, height) in chart_data.items():
+            for _idx, (title, (df, height)) in enumerate(chart_data.items()):
                 if df.empty or not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
                     st.warning(f"{title} 데이터를 표시할 수 없습니다. (필수 데이터 부족)")
                     continue
@@ -673,13 +776,40 @@ def display_candlestick_chart(stock_code, company_name):
 
                 fig_period.update_xaxes(rangebreaks=rangebreaks)
                 fig_period.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=height, margin=dict(l=10, r=10, b=10, t=40))
+                fig_period.update_layout(legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.6)', bordercolor='rgba(0,0,0,0.1)', borderwidth=1, font=dict(size=10)))
                 st.plotly_chart(fig_period, use_container_width=True)
+                # Keep references for combined export
+                if _idx == 0:
+                    st.session_state._last_fig_weekly = fig_period
+                elif _idx == 1:
+                    st.session_state._last_fig_monthly = fig_period
+        
 
+        # Auto-save combined JPG once all three charts exist
+        has_daily = '_last_fig_daily' in st.session_state
+        has_weekly = '_last_fig_weekly' in st.session_state
+        has_monthly = '_last_fig_monthly' in st.session_state
+        if has_daily and has_weekly and has_monthly:
+            ts_tag = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+            base_name = f"{_safe_filename(company_name)}_{ts_tag}.jpg"
+            if st.session_state.get('last_combined_saved') != base_name:
+                out_path = os.path.join(ROOT_DIR, 'reports', 'charts', base_name)
+                ok, saved = save_combined_charts_as_jpg(
+                    st.session_state._last_fig_daily,
+                    st.session_state._last_fig_weekly,
+                    st.session_state._last_fig_monthly,
+                    out_path
+                )
+                if ok:
+                    st.session_state['last_combined_saved'] = base_name
+                    st.success(f"통합 차트 자동 저장: {out_path}")
 # --- Main Application ---
 
 def main():
     st.set_page_config(layout="wide")
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+    # Reset per-run render guard
+    st.session_state['_charts_rendered_this_run'] = False
 
     # --- CSS Injection for Compact Layout ---
     st.markdown("""

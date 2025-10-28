@@ -15,6 +15,9 @@ OpenDartReader==0.2.3
 pandas
 numpy
 plotly==5.17.0
+kaleido>=0.2.1
+jpeg4py; python_version<'3.14'  # optional, ignore if not available
+pillow
 jinja2==3.1.2
 python-multipart==0.0.6
 python-jose[cryptography]==3.3.0

@@ -759,7 +759,7 @@ def generate_and_save_combined_chart_headless(stock_code, company_name, save_siz
             inv['for_cumulative'] = inv['for_netprps'].cumsum()
             inv['orgn_cumulative'] = inv['orgn_netprps'].cumsum()
             fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['ind_cumulative'], mode='lines', name='개인(누적)', line=dict(color='#2ca02c', width=2)), row=3, col=1)
-            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['for_cumulative'], mode='lines', name='외국인(누적)', line=dict(color='#1f77b4', width=2)), row=3, col=1)
+            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['for_cumulative'], mode='lines', name='외국인(누적)', line=dict(color='red', width=4)), row=3, col=1)
             fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['orgn_cumulative'], mode='lines', name='기관(누적)', line=dict(color='#ff7f0e', width=2, dash='dash')), row=3, col=1)
             fig_daily.update_layout(yaxis3_title_text='누적 순매수 금액')
         fig_daily.update_xaxes(rangebreaks=rangebreaks)
@@ -784,7 +784,8 @@ def generate_and_save_combined_chart_headless(stock_code, company_name, save_siz
     fname = f"{_safe_filename(company_name)}_{ts}.jpg"
     out_path = os.path.join(ROOT_DIR, 'reports', 'charts', fname)
     ok, saved = save_combined_charts_as_jpg(fig_daily, fig_weekly, fig_monthly, out_path, size=save_size)
-    return ok, saved if ok else False, saved
+    return ok, saved
+    return ok, saved
 
 # --- Plotting Functions ---
 

@@ -368,6 +368,16 @@ class KiwoomAPIHandler:
                     except Exception:
                         return 0.0
 
+            # Try to infer market classification if provided
+            market_raw = data.get('mkt_cls') or data.get('isu_mkt_cls') or data.get('market') or data.get('mkt_type') or data.get('mkt_div')
+            market = str(market_raw).upper() if market_raw is not None else ''
+            if 'KOSPI' in market or '코스피' in market:
+                market_std = '코스피'
+            elif 'KOSDAQ' in market or '코스닥' in market:
+                market_std = '코스닥'
+            else:
+                market_std = 'UNKNOWN'
+
             info = {
                 'price': clean_value(data.get('cur_prc', 0)),
                 'market_cap': int(clean_value(data.get('mac', 0)) * 100000000),
@@ -378,6 +388,7 @@ class KiwoomAPIHandler:
                 'roe': clean_value(data.get('roe', 0)),
                 'high_52w': clean_value(data.get('250hgst', 0)),
                 'low_52w': clean_value(data.get('250lwst', 0)),
+                'market': market_std,
             }
             return info
         except requests.exceptions.RequestException as e:
@@ -664,6 +675,116 @@ def reset_states_on_stock_change():
     ):
         if key in st.session_state:
             del st.session_state[key]
+
+# --- Batch Helpers ---
+
+@st.cache_data(ttl=3600)
+def load_stock_listing():
+    try:
+        df = pd.read_csv(os.path.join(APP_DIR, 'stock_list.csv'), dtype={'code': str, 'name': str})
+        if 'name' in df.columns and 'code' in df.columns:
+            return df[['name', 'code']]
+        return pd.DataFrame(columns=['name', 'code'])
+    except Exception:
+        return pd.DataFrame(columns=['name', 'code'])
+
+def collect_stock_metadata(delay_sec=0.5, limit=None):
+    df_list = load_stock_listing()
+    if df_list.empty:
+        st.error('종목 리스트를 불러오지 못했습니다.')
+        return pd.DataFrame()
+    rows = []
+    total = len(df_list) if limit is None else min(limit, len(df_list))
+    prog = st.progress(0.0, text='시가총액/시장 정보 수집 중...')
+    for idx, row in enumerate(df_list.itertuples(index=False)):
+        if limit is not None and idx >= limit:
+            break
+        name, code = row.name, row.code
+        try:
+            info = get_kiwoom_stock_info(code)
+            mcap = info.get('market_cap', 0)
+            market = info.get('market', 'UNKNOWN')
+            rows.append({'name': name, 'code': code, 'market': market, 'market_cap': mcap})
+        except Exception:
+            rows.append({'name': name, 'code': code, 'market': 'UNKNOWN', 'market_cap': 0})
+        time.sleep(max(0.0, float(delay_sec)))
+        prog.progress((idx + 1) / total, text=f'수집 중... {idx+1}/{total}')
+    meta = pd.DataFrame(rows)
+    try:
+        os.makedirs(os.path.join(ROOT_DIR, 'cache'), exist_ok=True)
+        meta.to_csv(os.path.join(ROOT_DIR, 'cache', 'stock_market_caps.csv'), index=False, encoding='utf-8-sig')
+    except Exception:
+        pass
+    return meta
+
+def build_candlestick_figure(df, title, height=300, rangebreaks=None):
+    if df.empty or not all(c in df.columns for c in ['open', 'high', 'low', 'close']):
+        return None
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                        subplot_titles=(title, '거래량'), row_heights=[0.7, 0.3])
+    fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='캔들'), row=1, col=1)
+    if 'volume' in df.columns:
+        colors = ['red' if c < o else 'green' for o, c in zip(df['open'], df['close'])]
+        fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='거래량', marker_color=colors), row=2, col=1)
+    if rangebreaks:
+        fig.update_xaxes(rangebreaks=rangebreaks)
+    fig.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=height, margin=dict(l=10, r=10, b=10, t=40))
+    fig.update_layout(legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.6)', bordercolor='rgba(0,0,0,0.1)', borderwidth=1, font=dict(size=10)))
+    return fig
+
+def generate_and_save_combined_chart_headless(stock_code, company_name, save_size=1400):
+    if 'kiwoom_handler' not in st.session_state:
+        return False, 'Kiwoom handler not initialized'
+    rangebreaks = [dict(bounds=["sat", "mon"])]
+    df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
+
+    df_daily_filtered = df_daily[df_daily.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
+    # Build daily with investor cumulative lines (3 rows)
+    fig_daily = None
+    if not df_daily_filtered.empty and all(c in df_daily_filtered.columns for c in ['open','high','low','close']):
+        try:
+            df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+        except Exception:
+            df_investor = pd.DataFrame()
+        fig_daily = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                                  subplot_titles=(f'{company_name} 일봉 (3개월)', '거래량', '투자자별 누적 순매수(백만원)'),
+                                  row_heights=[0.5, 0.2, 0.3])
+        fig_daily.add_trace(go.Candlestick(x=df_daily_filtered.index, open=df_daily_filtered['open'], high=df_daily_filtered['high'], low=df_daily_filtered['low'], close=df_daily_filtered['close'], name='캔들'), row=1, col=1)
+        if 'volume' in df_daily_filtered.columns:
+            colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
+            fig_daily.add_trace(go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='거래량', marker_color=colors), row=2, col=1)
+        if not df_investor.empty and all(c in df_investor.columns for c in ['ind_netprps','for_netprps','orgn_netprps']):
+            inv = df_investor[df_investor.index.isin(df_daily_filtered.index)].copy()
+            inv['ind_cumulative'] = inv['ind_netprps'].cumsum()
+            inv['for_cumulative'] = inv['for_netprps'].cumsum()
+            inv['orgn_cumulative'] = inv['orgn_netprps'].cumsum()
+            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['ind_cumulative'], mode='lines', name='개인(누적)', line=dict(color='#2ca02c', width=2)), row=3, col=1)
+            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['for_cumulative'], mode='lines', name='외국인(누적)', line=dict(color='#1f77b4', width=2)), row=3, col=1)
+            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['orgn_cumulative'], mode='lines', name='기관(누적)', line=dict(color='#ff7f0e', width=2, dash='dash')), row=3, col=1)
+            fig_daily.update_layout(yaxis3_title_text='누적 순매수 금액')
+        fig_daily.update_xaxes(rangebreaks=rangebreaks)
+        fig_daily.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=600, margin=dict(l=10, r=10, b=10, t=40))
+        fig_daily.update_layout(legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.6)', bordercolor='rgba(0,0,0,0.1)', borderwidth=1, font=dict(size=10)))
+
+    fig_weekly = None
+    if not df_weekly.empty:
+        dfw = df_weekly[df_weekly.index >= (pd.Timestamp.now() - pd.DateOffset(years=1))]
+        fig_weekly = build_candlestick_figure(dfw, f'{company_name} 주봉 (1년)', height=300, rangebreaks=rangebreaks)
+
+    fig_monthly = None
+    if not df_monthly.empty:
+        dfm = df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))]
+        fig_monthly = build_candlestick_figure(dfm, f'{company_name} 월봉 (3년)', height=300, rangebreaks=rangebreaks)
+
+    if not fig_daily or not fig_weekly or not fig_monthly:
+        return False, 'Insufficient data to build figures'
+
+    # Save combined with square layout
+    ts = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+    fname = f"{_safe_filename(company_name)}_{ts}.jpg"
+    out_path = os.path.join(ROOT_DIR, 'reports', 'charts', fname)
+    ok, saved = save_combined_charts_as_jpg(fig_daily, fig_weekly, fig_monthly, out_path, size=save_size)
+    return ok, saved if ok else False, saved
 
 # --- Plotting Functions ---
 
@@ -1112,6 +1233,67 @@ def main():
     
     st.divider()
     st.write("*본 보고서는 외부 출처로부터 얻은 정보에 기반하며, 정확성을 보장하지 않습니다. 투자 결정에 대한 최종 책임은 투자자 본인에게 있습니다.*")
+
+    # --- Batch Generation UI ---
+    st.header("7. 차트 일괄 생성 (Batch)")
+    with st.container(border=True):
+        meta_cols = st.columns([1,1,1,1])
+        if meta_cols[0].button('시장/시총 메타데이터 수집', help='전체 종목에 대해 시장 구분/시가총액을 수집합니다.'):
+            with st.spinner('시장/시총 메타데이터 수집 중...'):
+                meta_df = collect_stock_metadata(delay_sec=0.5)
+                if not meta_df.empty:
+                    st.success(f"수집 완료: {len(meta_df)}개")
+                    st.dataframe(meta_df.head(10), use_container_width=True)
+
+        # Load metadata from cache if exists, else from listing
+        meta_path = os.path.join(ROOT_DIR, 'cache', 'stock_market_caps.csv')
+        if os.path.exists(meta_path):
+            meta_df = pd.read_csv(meta_path, dtype={'code': str, 'name': str})
+        else:
+            meta_df = load_stock_listing()
+
+        market_opt = st.selectbox('시장 선택', options=['전체', '코스피', '코스닥'], index=0)
+        start_rank = st.number_input('시가총액 시작 순위', min_value=1, max_value=10000, value=1, step=1)
+        end_rank = st.number_input('시가총액 끝 순위', min_value=1, max_value=10000, value=100, step=1)
+        delay_call = st.slider('API 호출 간 딜레이(초)', min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+        save_size = st.select_slider('저장 이미지 크기(px, 정사각형 한 변)', options=[1000, 1200, 1400, 1600, 1800], value=1400)
+
+        if st.button('차트 일괄 생성 시작', use_container_width=True):
+            if meta_df.empty or 'market_cap' not in meta_df.columns:
+                st.error('시장/시가총액 메타데이터가 없습니다. 먼저 "시장/시총 메타데이터 수집"을 실행하세요.')
+            else:
+                df = meta_df.copy()
+                if market_opt != '전체' and 'market' in df.columns:
+                    df = df[df['market'] == market_opt]
+                if 'market_cap' in df.columns:
+                    df = df.sort_values('market_cap', ascending=False)
+                s = int(start_rank); e = int(end_rank)
+                if e < s:
+                    s, e = e, s
+                s = max(1, min(s, len(df)))
+                e = max(1, min(e, len(df)))
+                top_n = e - s + 1
+                df = df.iloc[s-1:e]
+                st.info(f"대상 종목: {len(df)}개 (시장: {market_opt}, 상위 {int(top_n)})")
+
+                prog = st.progress(0.0, text='일괄 생성 중...')
+                logs = []
+                total = len(df)
+                for i, row in enumerate(df.itertuples(index=False)):
+                    name, code = row.name, row.code
+                    try:
+                        ok, path_or_err = generate_and_save_combined_chart_headless(code, name, save_size=save_size)
+                        if ok:
+                            logs.append(f"[{i+1}/{total}] {name}({code}) -> 저장: {path_or_err}")
+                        else:
+                            logs.append(f"[{i+1}/{total}] {name}({code}) -> 실패: {path_or_err}")
+                    except Exception as e:
+                        logs.append(f"[{i+1}/{total}] {name}({code}) -> 예외 발생: {e}")
+                    prog.progress((i+1)/total, text=f'일괄 생성 중... {i+1}/{total}')
+                    time.sleep(float(delay_call))
+
+                st.success('일괄 생성 완료')
+                st.text_area('로그', value='\n'.join(logs), height=200)
 
 if __name__ == "__main__":
     main()

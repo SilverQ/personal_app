@@ -15,10 +15,353 @@ from plotly.subplots import make_subplots
 import plotly.io as pio
 from PIL import Image
 from io import BytesIO
+from typing import Any, Dict, List
 
 # --- Constants and Paths ---
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(APP_DIR)
+
+# --- JSON Store Helpers ---
+
+def _instrument_id_from_code(code: str, market: str = 'KRX') -> str:
+    try:
+        c = str(code).strip()
+    except Exception:
+        c = str(code)
+    m = (market or 'KRX').strip() if isinstance(market, str) else 'KRX'
+    return f"{m}:{c}"
+
+def _data_base_dir() -> str:
+    return os.path.join(ROOT_DIR, '@data')
+
+def _timeseries_dir(code: str) -> str:
+    return os.path.join(_data_base_dir(), 'timeseries', code)
+
+def _instruments_dir() -> str:
+    return os.path.join(_data_base_dir(), 'instruments')
+
+def _manifests_dir() -> str:
+    return os.path.join(_data_base_dir(), 'manifests')
+
+def _ensure_dirs(*paths: str):
+    for p in paths:
+        try:
+            os.makedirs(p, exist_ok=True)
+        except Exception:
+            pass
+
+def _year_from_date(d: pd.Timestamp) -> int:
+    return int(pd.Timestamp(d).year)
+
+def _load_json(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_json_atomic(path: str, obj: Dict[str, Any]):
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # Best-effort write; fall back to direct write
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+def _candles_year_path(code: str, year: int) -> str:
+    return os.path.join(_timeseries_dir(code), f'candles_daily-{year}.json')
+
+def _investor_year_path(code: str, year: int) -> str:
+    return os.path.join(_timeseries_dir(code), f'investor_flows-{year}.json')
+
+def _init_candles_header(code: str, year: int) -> Dict[str, Any]:
+    return {
+        'schema_version': '1.0.0',
+        'resource_type': 'timeseries/candles',
+        'instrument_id': _instrument_id_from_code(code),
+        'interval': 'daily',
+        'year': int(year),
+        'meta': {'currency': 'KRW', 'timezone': 'Asia/Seoul', 'units': {'volume': 'shares'}},
+        'source': {'name': 'Kiwoom', 'endpoint': '/api/dostk/chart', 'api_id': 'ka10081'},
+        'retrieved_at': pd.Timestamp.now().isoformat(),
+        'data': {}
+    }
+
+def _init_investor_header(code: str, year: int) -> Dict[str, Any]:
+    return {
+        'schema_version': '1.0.0',
+        'resource_type': 'timeseries/investor_flows',
+        'instrument_id': _instrument_id_from_code(code),
+        'year': int(year),
+        'meta': {'currency': 'KRW', 'unit': 'KRW', 'scale': 1.0},
+        'source': {'name': 'Kiwoom', 'endpoint': '/api/dostk/stkinfo', 'api_id': 'ka10059'},
+        'retrieved_at': pd.Timestamp.now().isoformat(),
+        'data': {}
+    }
+
+def _upsert_manifest(code: str, dataset: str, year: int, dates: List[str]):
+    _ensure_dirs(_manifests_dir())
+    mpath = os.path.join(_manifests_dir(), f'{code}.json')
+    manifest = _load_json(mpath) or {
+        'schema_version': '1.0.0',
+        'instrument_id': _instrument_id_from_code(code),
+        'datasets': {}
+    }
+    ds_list = manifest.get('datasets', {}).get(dataset, [])
+    # Find year entry
+    entry = None
+    for e in ds_list:
+        if int(e.get('year', -1)) == int(year):
+            entry = e
+            break
+    if not dates:
+        # nothing to update
+        _save_json_atomic(mpath, manifest)
+        return
+    start_d = min(dates)
+    end_d = max(dates)
+    now_iso = pd.Timestamp.now().isoformat()
+    if entry is None:
+        entry = {'year': int(year), 'start': start_d, 'end': end_d, 'last_updated': now_iso}
+        ds_list.append(entry)
+    else:
+        entry['start'] = min(entry.get('start', start_d), start_d)
+        entry['end'] = max(entry.get('end', end_d), end_d)
+        entry['last_updated'] = now_iso
+    manifest.setdefault('datasets', {})[dataset] = ds_list
+    _save_json_atomic(mpath, manifest)
+
+def upsert_instrument_metadata(code: str, name: str = None, market: str = None, currency: str = 'KRW'):
+    """Create or update instrument metadata file @data/instruments/{code}.json"""
+    _ensure_dirs(_instruments_dir())
+    ipath = os.path.join(_instruments_dir(), f'{code}.json')
+    obj = _load_json(ipath) or {
+        'schema_version': '1.0.0',
+        'resource_type': 'instrument',
+        'instrument_id': _instrument_id_from_code(code),
+        'code': code,
+    }
+    if name:
+        obj['name'] = name
+    if market:
+        obj['market'] = market
+    if currency:
+        obj['currency'] = currency
+    obj['retrieved_at'] = pd.Timestamp.now().isoformat()
+    _save_json_atomic(ipath, obj)
+
+def upsert_daily_candles_store(code: str, df_daily: pd.DataFrame):
+    if df_daily is None or df_daily.empty:
+        return
+    _ensure_dirs(_timeseries_dir(code))
+    # Expect df_daily index as datetime-like
+    dfi = df_daily.copy()
+    try:
+        dfi.index = pd.to_datetime(dfi.index)
+    except Exception:
+        dfi.index = pd.to_datetime(dfi.index, errors='coerce')
+    dates_group = {}
+    for d, row in dfi.iterrows():
+        if pd.isna(d):
+            continue
+        y = _year_from_date(d)
+        dates_group.setdefault(y, []).append((pd.Timestamp(d).strftime('%Y-%m-%d'), row))
+    for year, items in dates_group.items():
+        path = _candles_year_path(code, year)
+        obj = _load_json(path)
+        if not obj:
+            obj = _init_candles_header(code, year)
+        data = obj.setdefault('data', {})
+        written_dates = []
+        for day_str, row in items:
+            try:
+                data[day_str] = {
+                    'o': float(row.get('open', float('nan'))),
+                    'h': float(row.get('high', float('nan'))),
+                    'l': float(row.get('low', float('nan'))),
+                    'c': float(row.get('close', float('nan'))),
+                    'v': float(row.get('volume', float('nan'))) if 'volume' in row else None,
+                    'as_of': pd.Timestamp.now().isoformat()
+                }
+                written_dates.append(day_str)
+            except Exception:
+                continue
+        obj['retrieved_at'] = pd.Timestamp.now().isoformat()
+        _save_json_atomic(path, obj)
+        _upsert_manifest(code, 'candles_daily', year, written_dates)
+
+def upsert_investor_flows_store(code: str, df_inv: pd.DataFrame):
+    if df_inv is None or df_inv.empty:
+        return
+    _ensure_dirs(_timeseries_dir(code))
+    dfi = df_inv.copy()
+    try:
+        dfi.index = pd.to_datetime(dfi.index)
+    except Exception:
+        dfi.index = pd.to_datetime(dfi.index, errors='coerce')
+    dates_group = {}
+    for d, row in dfi.iterrows():
+        if pd.isna(d):
+            continue
+        y = _year_from_date(d)
+        dates_group.setdefault(y, []).append((pd.Timestamp(d).strftime('%Y-%m-%d'), row))
+    for year, items in dates_group.items():
+        path = _investor_year_path(code, year)
+        obj = _load_json(path)
+        if not obj:
+            obj = _init_investor_header(code, year)
+        data = obj.setdefault('data', {})
+        written_dates = []
+        for day_str, row in items:
+            try:
+                data[day_str] = {
+                    'individual': float(row.get('ind_netprps', 0.0)),
+                    'foreign': float(row.get('for_netprps', 0.0)),
+                    'institution': float(row.get('orgn_netprps', 0.0)),
+                    'as_of': pd.Timestamp.now().isoformat()
+                }
+                written_dates.append(day_str)
+            except Exception:
+                continue
+        obj['retrieved_at'] = pd.Timestamp.now().isoformat()
+        _save_json_atomic(path, obj)
+        _upsert_manifest(code, 'investor_flows', year, written_dates)
+
+def load_daily_candles_from_store(code: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    try:
+        start_date = pd.Timestamp(start_date).normalize()
+        end_date = pd.Timestamp(end_date).normalize()
+    except Exception:
+        return pd.DataFrame()
+    years = list(range(start_date.year, end_date.year + 1))
+    records = []
+    for y in years:
+        path = _candles_year_path(code, y)
+        obj = _load_json(path)
+        if not obj or 'data' not in obj:
+            continue
+        for d, v in obj['data'].items():
+            try:
+                ts = pd.to_datetime(d)
+            except Exception:
+                continue
+            if ts < start_date or ts > end_date:
+                continue
+            records.append({'date': ts, 'open': v.get('o'), 'high': v.get('h'), 'low': v.get('l'), 'close': v.get('c'), 'volume': v.get('v')})
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame.from_records(records).set_index('date').sort_index()
+    return df
+
+def load_investor_flows_from_store(code: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    try:
+        start_date = pd.Timestamp(start_date).normalize()
+        end_date = pd.Timestamp(end_date).normalize()
+    except Exception:
+        return pd.DataFrame()
+    years = list(range(start_date.year, end_date.year + 1))
+    records = []
+    for y in years:
+        path = _investor_year_path(code, y)
+        obj = _load_json(path)
+        if not obj or 'data' not in obj:
+            continue
+        for d, v in obj['data'].items():
+            try:
+                ts = pd.to_datetime(d)
+            except Exception:
+                continue
+            if ts < start_date or ts > end_date:
+                continue
+            records.append({'date': ts, 'ind_netprps': v.get('individual', 0.0), 'for_netprps': v.get('foreign', 0.0), 'orgn_netprps': v.get('institution', 0.0)})
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame.from_records(records).set_index('date').sort_index()
+    return df
+
+# --- Derivation helpers (reuse store to build weekly/monthly) ---
+def _has_coverage(df: pd.DataFrame, start_date: pd.Timestamp, end_date: pd.Timestamp, tolerance_days: int = 3) -> bool:
+    if df is None or df.empty:
+        return False
+    try:
+        s = pd.Timestamp(start_date).normalize()
+        e = pd.Timestamp(end_date).normalize()
+        dmin = pd.Timestamp(df.index.min()).normalize()
+        dmax = pd.Timestamp(df.index.max()).normalize()
+        return (dmin <= s + pd.Timedelta(days=tolerance_days)) and (dmax >= e - pd.Timedelta(days=1))
+    except Exception:
+        return False
+
+def derive_weekly_monthly_from_daily(df_daily: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
+    if df_daily is None or df_daily.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    dfd = df_daily.copy()
+    try:
+        dfd.index = pd.to_datetime(dfd.index)
+    except Exception:
+        dfd.index = pd.to_datetime(dfd.index, errors='coerce')
+    dfd = dfd.sort_index()
+    agg = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last'
+    }
+    if 'volume' in dfd.columns:
+        agg['volume'] = 'sum'
+    try:
+        weekly = dfd.resample('W-FRI').agg(agg).dropna(how='all')
+    except Exception:
+        weekly = pd.DataFrame()
+    try:
+        monthly = dfd.resample('M').agg(agg).dropna(how='all')
+    except Exception:
+        monthly = pd.DataFrame()
+    return weekly, monthly
+
+# --- Helpers to validate/repair period frequency ---
+def ensure_monthly_frequency(df_monthly: pd.DataFrame,
+                             df_daily_full: pd.DataFrame = None,
+                             df_weekly: pd.DataFrame = None) -> pd.DataFrame:
+    """Ensure we have approximately one candlestick per calendar month.
+    If the provided monthly DataFrame looks quarterly/sparse, try to rebuild
+    from a wider daily dataset; if not available, rebuild from weekly.
+    """
+    try:
+        if df_monthly is None or df_monthly.empty:
+            # Try rebuild
+            if isinstance(df_daily_full, pd.DataFrame) and not df_daily_full.empty:
+                _, monthly = derive_weekly_monthly_from_daily(df_daily_full)
+                return monthly
+            if isinstance(df_weekly, pd.DataFrame) and not df_weekly.empty:
+                dfw = df_weekly.copy()
+                dfw.index = pd.to_datetime(dfw.index)
+                agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
+                if 'volume' in dfw.columns:
+                    agg['volume'] = 'sum'
+                return dfw.resample('M').agg(agg).dropna(how='all')
+
+        idx = pd.to_datetime(df_monthly.index)
+        idx = idx.sort_values()
+        if len(idx) < 6:
+            # Too few points, try rebuild
+            return ensure_monthly_frequency(pd.DataFrame(), df_daily_full, df_weekly)
+        # Compute typical gap in days
+        gaps = np.diff(idx.values).astype('timedelta64[D]').astype(int)
+        median_gap = np.median(gaps) if len(gaps) else 30
+        # If median gap > 50 days, it's likely quarterly or sparser
+        if median_gap > 50:
+            return ensure_monthly_frequency(pd.DataFrame(), df_daily_full, df_weekly)
+        return df_monthly
+    except Exception:
+        # Best-effort: return as-is on failure
+        return df_monthly
 
 # --- Utility: Save charts as JPG ---
 def _safe_filename(name: str) -> str:
@@ -40,6 +383,14 @@ def save_plotly_fig_as_jpg(fig, out_path, width=1200, height=800, scale=2):
         pio.write_image(fig, out_path, format='jpg', engine='kaleido', width=width, height=height, scale=scale)
         return True, out_path
     except Exception as e:
+        # English fallback messages to avoid encoding issues
+        st.error(f"Combined chart export failed: {e}")
+        st.info("Image export requires 'kaleido' and 'pillow'. Install: pip install -U kaleido pillow")
+        return False, str(e)
+        # English fallback messages to avoid encoding issues
+        st.error(f"Chart export failed: {e}")
+        st.info("Image export requires 'kaleido'. Install: pip install -U kaleido")
+        return False, str(e)
         st.error(f"차트 저장 실패: {e}")
         st.info("이미지 저장을 위해 'kaleido' 패키지가 필요합니다. 설치: pip install -U kaleido")
         return False, str(e)
@@ -637,7 +988,21 @@ def get_kiwoom_token():
 
 def get_kiwoom_stock_info(stock_code):
     if 'kiwoom_handler' not in st.session_state: return {}
-    return st.session_state.kiwoom_handler.get_stock_info(stock_code)
+    info = st.session_state.kiwoom_handler.get_stock_info(stock_code)
+    # Persist basic instrument metadata if available
+    try:
+        name = None
+        try:
+            df_list = get_stock_list()
+            if not df_list.empty:
+                row = df_list[df_list['code'] == str(stock_code)].iloc[0]
+                name = row['name']
+        except Exception:
+            name = None
+        upsert_instrument_metadata(stock_code, name=name, market=info.get('market'))
+    except Exception:
+        pass
+    return info
 
 def generate_gemini_content(prompt, system_instruction):
     if 'gemini_handler' not in st.session_state: return "오류: Gemini 핸들러가 초기화되지 않았습니다."
@@ -736,16 +1101,53 @@ def generate_and_save_combined_chart_headless(stock_code, company_name, save_siz
     if 'kiwoom_handler' not in st.session_state:
         return False, 'Kiwoom handler not initialized'
     rangebreaks = [dict(bounds=["sat", "mon"])]
-    df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
+    now = pd.Timestamp.now()
+    start_3m = now - pd.DateOffset(months=3)
+    # Load daily for last 3 months (daily panel)
+    df_daily = load_daily_candles_from_store(stock_code, start_3m, now)
+    if df_daily is None or df_daily.empty or not _has_coverage(df_daily, start_3m, now):
+        # Fetch from API and persist
+        api_daily, api_weekly, api_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
+        df_daily = api_daily
+        try:
+            upsert_daily_candles_store(stock_code, api_daily)
+        except Exception:
+            pass
+        df_weekly, df_monthly = api_weekly, api_monthly
+    else:
+        # Derive weekly/monthly from a wider daily window (up to 3 years)
+        try:
+            start_3y = now - pd.DateOffset(years=3)
+            df_daily_full = load_daily_candles_from_store(stock_code, start_3y, now)
+        except Exception:
+            df_daily_full = pd.DataFrame()
+        if df_daily_full is None or df_daily_full.empty:
+            # Fallback to API to get weekly/monthly directly
+            _, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
+        else:
+            df_weekly, df_monthly = derive_weekly_monthly_from_daily(df_daily_full)
+        # Ensure monthly truly has monthly frequency
+        try:
+            df_monthly = ensure_monthly_frequency(df_monthly, df_daily_full, df_weekly)
+        except Exception:
+            pass
 
-    df_daily_filtered = df_daily[df_daily.index >= (pd.Timestamp.now() - pd.DateOffset(months=3))]
+    df_daily_filtered = df_daily[df_daily.index >= start_3m]
     # Build daily with investor cumulative lines (3 rows)
     fig_daily = None
     if not df_daily_filtered.empty and all(c in df_daily_filtered.columns for c in ['open','high','low','close']):
+        # Investor flows: prefer store for same window; else fetch and persist
         try:
-            df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+            df_investor = load_investor_flows_from_store(stock_code, df_daily_filtered.index.min(), df_daily_filtered.index.max())
+            if df_investor is None or df_investor.empty:
+                df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+                try:
+                    upsert_investor_flows_store(stock_code, df_investor)
+                except Exception:
+                    pass
         except Exception:
             df_investor = pd.DataFrame()
+        """ Disabled due to encoding issues
         fig_daily = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
                                   subplot_titles=(f'{company_name} 일봉 (3개월)', '거래량', '투자자별 누적 순매수(백만원)'),
                                   row_heights=[0.5, 0.2, 0.3])
@@ -765,6 +1167,52 @@ def generate_and_save_combined_chart_headless(stock_code, company_name, save_siz
         fig_daily.update_xaxes(rangebreaks=rangebreaks)
         fig_daily.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=600, margin=dict(l=10, r=10, b=10, t=40))
         fig_daily.update_layout(legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.6)', bordercolor='rgba(0,0,0,0.1)', borderwidth=1, font=dict(size=10)))
+        """
+
+        # Rebuilt (English) daily chart block
+        fig_daily = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            subplot_titles=(
+                f"{company_name} Daily (3M)",
+                "Volume",
+                "Investor net buy/sell (million KRW)"
+            ),
+            row_heights=[0.5, 0.2, 0.3]
+        )
+        fig_daily.add_trace(
+            go.Candlestick(
+                x=df_daily_filtered.index,
+                open=df_daily_filtered['open'],
+                high=df_daily_filtered['high'],
+                low=df_daily_filtered['low'],
+                close=df_daily_filtered['close'],
+                name='Candles'
+            ),
+            row=1,
+            col=1
+        )
+        if 'volume' in df_daily_filtered.columns:
+            colors = ['red' if c < o else 'green' for o, c in zip(df_daily_filtered['open'], df_daily_filtered['close'])]
+            fig_daily.add_trace(
+                go.Bar(x=df_daily_filtered.index, y=df_daily_filtered['volume'], name='Volume', marker_color=colors),
+                row=2,
+                col=1
+            )
+        if not df_investor.empty and all(c in df_investor.columns for c in ['ind_netprps','for_netprps','orgn_netprps']):
+            inv = df_investor[df_investor.index.isin(df_daily_filtered.index)].copy()
+            inv['ind_cumulative'] = inv['ind_netprps'].cumsum()
+            inv['for_cumulative'] = inv['for_netprps'].cumsum()
+            inv['orgn_cumulative'] = inv['orgn_netprps'].cumsum()
+            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['ind_cumulative'], mode='lines', name='Individuals (cum)', line=dict(color='#2ca02c', width=2)), row=3, col=1)
+            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['for_cumulative'], mode='lines', name='Foreigners (cum)', line=dict(color='red', width=4)), row=3, col=1)
+            fig_daily.add_trace(go.Scatter(x=inv.index, y=inv['orgn_cumulative'], mode='lines', name='Institutions (cum)', line=dict(color='#ff7f0e', width=2, dash='dash')), row=3, col=1)
+            fig_daily.update_layout(yaxis3_title_text='Net buy/sell amount')
+        fig_daily.update_xaxes(rangebreaks=rangebreaks)
+        fig_daily.update_layout(xaxis_rangeslider_visible=False, showlegend=True, height=600, margin=dict(l=10, r=10, b=10, t=40))
+        fig_daily.update_layout(legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top', bgcolor='rgba(255,255,255,0.6)', bordercolor='rgba(0,0,0,0.1)', borderwidth=1, font=dict(size=10)))
 
     fig_weekly = None
     if not df_weekly.empty:
@@ -776,6 +1224,15 @@ def generate_and_save_combined_chart_headless(stock_code, company_name, save_siz
         dfm = df_monthly[df_monthly.index >= (pd.Timestamp.now() - pd.DateOffset(years=3))]
         fig_monthly = build_candlestick_figure(dfm, f'{company_name} 월봉 (3년)', height=300, rangebreaks=rangebreaks)
 
+    # Normalize weekly/monthly titles to English
+    try:
+        if fig_weekly is not None:
+            fig_weekly.update_layout(title=f'{company_name} Weekly (1Y)')
+        if fig_monthly is not None:
+            fig_monthly.update_layout(title=f'{company_name} Monthly (3Y)')
+    except Exception:
+        pass
+
     if not fig_daily or not fig_weekly or not fig_monthly:
         return False, 'Insufficient data to build figures'
 
@@ -784,8 +1241,218 @@ def generate_and_save_combined_chart_headless(stock_code, company_name, save_siz
     fname = f"{_safe_filename(company_name)}_{ts}.jpg"
     out_path = os.path.join(ROOT_DIR, 'reports', 'charts', fname)
     ok, saved = save_combined_charts_as_jpg(fig_daily, fig_weekly, fig_monthly, out_path, size=save_size)
+
+    # Persist normalized, date-keyed daily data to the store
+    try:
+        # Update instrument metadata with provided name (market optional)
+        try:
+            upsert_instrument_metadata(stock_code, company_name)
+        except Exception:
+            pass
+        upsert_daily_candles_store(stock_code, df_daily)
+        try:
+            if 'df_investor' in locals() and isinstance(df_investor, pd.DataFrame) and not df_investor.empty:
+                upsert_investor_flows_store(stock_code, df_investor)
+        except Exception:
+            pass
+    except Exception:
+        # Ignore store write errors; chart export already succeeded
+        pass
+
     return ok, saved
-    return ok, saved
+
+# --- Similarity Search (Time-Series) ---
+
+def _similarity_dir() -> str:
+    return os.path.join(_data_base_dir(), 'similarity')
+
+def _similarity_index_path(window: int, feature: str) -> str:
+    safe_feature = re.sub(r'[^a-zA-Z0-9_-]', '', str(feature or 'returns'))
+    return os.path.join(_similarity_dir(), f'index-{int(window)}-{safe_feature}.json')
+
+def _vectorize_series_close(df: pd.DataFrame, window: int) -> (List[str], np.ndarray):
+    if df is None or df.empty or 'close' not in df.columns:
+        return [], np.array([])
+    s = df['close'].dropna().tail(int(window))
+    if len(s) < max(3, int(window * 0.8)):
+        return [], np.array([])
+    std = s.std()
+    z = (s - s.mean()) / (std if std and std > 0 else 1.0)
+    dates = [pd.Timestamp(i).strftime('%Y-%m-%d') for i in s.index]
+    return dates, z.values.astype(float)
+
+def _vectorize_series_returns(df: pd.DataFrame, window: int) -> (List[str], np.ndarray):
+    if df is None or df.empty or 'close' not in df.columns:
+        return [], np.array([])
+    c = df['close'].dropna()
+    if c.empty:
+        return [], np.array([])
+    r = np.log(c).diff().dropna()
+    r = r.tail(int(window))
+    if len(r) < max(3, int(window * 0.8)):
+        return [], np.array([])
+    std = r.std()
+    z = (r - r.mean()) / (std if std and std > 0 else 1.0)
+    dates = [pd.Timestamp(i).strftime('%Y-%m-%d') for i in r.index]
+    return dates, z.values.astype(float)
+
+def _vectorize(df: pd.DataFrame, window: int, feature: str) -> (List[str], np.ndarray):
+    f = (feature or 'returns').lower()
+    if f == 'price':
+        return _vectorize_series_close(df, window)
+    return _vectorize_series_returns(df, window)
+
+def _corr_distance(x: np.ndarray, y: np.ndarray) -> float:
+    try:
+        if x.size == 0 or y.size == 0:
+            return float('inf')
+        xm = x - np.mean(x)
+        ym = y - np.mean(y)
+        xs = np.std(xm)
+        ys = np.std(ym)
+        if xs == 0 or ys == 0:
+            return float('inf')
+        corr = float(np.dot(xm, ym) / (len(xm) * xs * ys))
+        corr = max(-1.0, min(1.0, corr))
+        return 1.0 - corr
+    except Exception:
+        return float('inf')
+
+@st.cache_data(ttl=3600)
+def build_similarity_index(window: int = 60, feature: str = 'returns', market: str = None) -> Dict[str, Any]:
+    """Build a lightweight similarity index from the local store.
+    - window: number of recent points per vector
+    - feature: 'returns' (default) or 'price'
+    - market: optional filter, expects values like '코스피', '코스닥', 'UNKNOWN', or None for all
+    Returns index dict and also persists to @data/similarity.
+    """
+    try:
+        _ensure_dirs(_similarity_dir())
+    except Exception:
+        pass
+
+    now = pd.Timestamp.now()
+    df_list = get_stock_list()
+    if df_list is None or df_list.empty or 'code' not in df_list.columns:
+        return {'window': int(window), 'feature': feature, 'vectors': {}, 'updated_at': now.isoformat()}
+
+    meta_path = os.path.join(ROOT_DIR, 'cache', 'stock_market_caps.csv')
+    meta = None
+    try:
+        if os.path.exists(meta_path):
+            meta = pd.read_csv(meta_path, dtype={'code': str, 'name': str})
+    except Exception:
+        meta = None
+
+    universe = df_list.copy()
+    if isinstance(meta, pd.DataFrame) and not meta.empty and 'market' in meta.columns:
+        universe = universe.merge(meta[['code', 'market']], on='code', how='left')
+        if market and market != '전체':
+            universe = universe[universe['market'] == market]
+
+    vectors: Dict[str, Dict[str, Any]] = {}
+    start = now - pd.Timedelta(days=int(window * 3))
+    for row in universe.itertuples(index=False):
+        try:
+            code = getattr(row, 'code')
+        except Exception:
+            continue
+        try:
+            df = load_daily_candles_from_store(code, start, now)
+            dates, vec = _vectorize(df, int(window), feature)
+            if len(dates) >= max(3, int(window * 0.8)):
+                vectors[str(code)] = {'dates': dates, 'vec': [float(v) for v in vec]}
+        except Exception:
+            continue
+
+    index = {
+        'schema_version': '1.0.0',
+        'window': int(window),
+        'feature': str(feature or 'returns'),
+        'vectors': vectors,
+        'updated_at': now.isoformat()
+    }
+    try:
+        _save_json_atomic(_similarity_index_path(window, feature), index)
+    except Exception:
+        pass
+    return index
+
+def _load_similarity_index(window: int, feature: str) -> Dict[str, Any]:
+    path = _similarity_index_path(window, feature)
+    obj = _load_json(path)
+    return obj if obj else {}
+
+def find_similar(query_code: str, topn: int = 20, window: int = 60, feature: str = 'returns', market: str = None) -> List[Dict[str, Any]]:
+    """Return a sorted list of similar tickers to query_code using correlation distance."""
+    try:
+        idx = _load_similarity_index(window, feature)
+        if not idx or 'vectors' not in idx:
+            idx = build_similarity_index(window=window, feature=feature, market=market)
+    except Exception:
+        idx = build_similarity_index(window=window, feature=feature, market=market)
+
+    now = pd.Timestamp.now()
+    start = now - pd.Timedelta(days=int(window * 3))
+    df_q = load_daily_candles_from_store(query_code, start, now)
+    q_dates, q_vec = _vectorize(df_q, int(window), feature)
+    if len(q_dates) < max(3, int(window * 0.8)):
+        return []
+
+    q_map = {d: float(v) for d, v in zip(q_dates, q_vec)}
+    min_overlap = max(3, int(window * 0.8))
+
+    results = []
+    for code, entry in idx.get('vectors', {}).items():
+        if str(code) == str(query_code):
+            continue
+        try:
+            cd = entry.get('dates') or []
+            cv = entry.get('vec') or []
+            if not cd or not cv:
+                continue
+            common = sorted(set(cd).intersection(q_dates))
+            if len(common) < min_overlap:
+                continue
+            x = np.array([q_map[d] for d in common], dtype=float)
+            c_map = {d: float(v) for d, v in zip(cd, cv)}
+            y = np.array([c_map[d] for d in common], dtype=float)
+            dist = _corr_distance(x, y)
+            if not np.isfinite(dist):
+                continue
+            results.append({'code': code, 'distance': float(dist), 'overlap': int(len(common))})
+        except Exception:
+            continue
+    results.sort(key=lambda r: (r['distance'], -r['overlap']))
+    return results[:int(topn)]
+
+def _overlay_figure_for_pair(query_code: str, other_code: str, window: int, feature: str, title_map: Dict[str, str]) -> Any:
+    """Small overlay plot (query vs. candidate) normalized on overlapping dates."""
+    now = pd.Timestamp.now()
+    start = now - pd.Timedelta(days=int(window * 3))
+    df_q = load_daily_candles_from_store(query_code, start, now)
+    df_o = load_daily_candles_from_store(other_code, start, now)
+    if df_q is None or df_q.empty or df_o is None or df_o.empty:
+        return None
+    qd, qv = _vectorize(df_q, int(window), 'price') if 'close' in df_q.columns else _vectorize(df_q, int(window), feature)
+    od, ov = _vectorize(df_o, int(window), 'price') if 'close' in df_o.columns else _vectorize(df_o, int(window), feature)
+    if not qd or not od:
+        return None
+    common = sorted(set(qd).intersection(od))
+    if len(common) < max(3, int(window * 0.8)):
+        return None
+    q_map = {d: float(v) for d, v in zip(qd, qv)}
+    o_map = {d: float(v) for d, v in zip(od, ov)}
+    xs = common
+    y1 = [q_map[d] for d in xs]
+    y2 = [o_map[d] for d in xs]
+    fig = go.Figure()
+    q_title = title_map.get(str(query_code), str(query_code))
+    o_title = title_map.get(str(other_code), str(other_code))
+    fig.add_trace(go.Scatter(x=xs, y=y1, mode='lines', name=q_title, line=dict(color='#1f77b4', width=2)))
+    fig.add_trace(go.Scatter(x=xs, y=y2, mode='lines', name=o_title, line=dict(color='#ff7f0e', width=2, dash='dash')))
+    fig.update_layout(height=220, margin=dict(l=10, r=10, t=30, b=10), showlegend=False, title=f"{q_title} vs {o_title}")
+    return fig
 
 # --- Plotting Functions ---
 
@@ -801,7 +1468,37 @@ def display_candlestick_chart(stock_code, company_name):
 
     with st.spinner("주가 및 투자자 동향 데이터를 조회하고 차트를 생성 중입니다..."):
         rangebreaks = [dict(bounds=["sat", "mon"])]  # 주말 제외
-        df_daily, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
+        # Prefer locally stored data for daily; derive weekly/monthly when possible
+        now = pd.Timestamp.now()
+        start_3m = now - pd.DateOffset(months=3)
+        df_daily = load_daily_candles_from_store(stock_code, start_3m, now)
+        if df_daily is None or df_daily.empty or not _has_coverage(df_daily, start_3m, now):
+            # Fallback to API and persist for reuse
+            df_daily_api, df_weekly_api, df_monthly_api = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
+            df_daily = df_daily_api
+            try:
+                upsert_daily_candles_store(stock_code, df_daily_api)
+            except Exception:
+                pass
+            df_weekly, df_monthly = df_weekly_api, df_monthly_api
+        else:
+            # Derive weekly/monthly from a wider daily window (up to 3 years)
+            try:
+                now = pd.Timestamp.now()
+                start_3y = now - pd.DateOffset(years=3)
+                df_daily_full = load_daily_candles_from_store(stock_code, start_3y, now)
+            except Exception:
+                df_daily_full = pd.DataFrame()
+            if df_daily_full is None or df_daily_full.empty:
+                # Fallback to API for weekly/monthly if store lacks coverage
+                _, df_weekly, df_monthly = st.session_state.kiwoom_handler.fetch_all_chart_data(stock_code)
+            else:
+                df_weekly, df_monthly = derive_weekly_monthly_from_daily(df_daily_full)
+            # Ensure monthly truly has monthly frequency
+            try:
+                df_monthly = ensure_monthly_frequency(df_monthly, df_daily_full, df_weekly)
+            except Exception:
+                pass
 
         col1, col2 = st.columns(2)
 
@@ -823,7 +1520,17 @@ def display_candlestick_chart(stock_code, company_name):
                 daily_title = f'{company_name} 일봉 (3개월)'
                 fig_daily = None
                 if has_ohlc:
-                    df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+                    # Try to reuse investor flows from store for the same daily range
+                    inv_store = load_investor_flows_from_store(stock_code, df_daily_filtered.index.min(), df_daily_filtered.index.max())
+                    if isinstance(inv_store, pd.DataFrame) and not inv_store.empty:
+                        df_investor = inv_store
+                    else:
+                        df_investor = st.session_state.kiwoom_handler.fetch_investor_data(stock_code)
+                        # Persist investor flows (date-keyed) for reuse
+                        try:
+                            upsert_investor_flows_store(stock_code, df_investor)
+                        except Exception:
+                            pass
                     fig_daily = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
                                               subplot_titles=(daily_title, '거래량', '투자자별 누적 순매수 동향 (백만원)'),
                                               row_heights=[0.5, 0.2, 0.3])
@@ -925,6 +1632,144 @@ def display_candlestick_chart(stock_code, company_name):
                 if ok:
                     st.session_state['last_combined_saved'] = base_name
                     st.success(f"통합 차트 자동 저장: {out_path}")
+# --- Data Similarity (Stored Data, non-chart) ---
+
+@st.cache_data(ttl=3600)
+def _compute_features_from_store(code: str, window_days: int = 120) -> Dict[str, float]:
+    """Compute data-driven features from locally stored JSON (candles + investor flows)."""
+    try:
+        now = pd.Timestamp.now()
+        start = now - pd.Timedelta(days=int(window_days * 3))
+        df = load_daily_candles_from_store(code, start, now)
+        if df is None or df.empty or 'close' not in df.columns:
+            return {}
+        df = df.sort_index()
+        c = df['close'].dropna()
+        if c.empty:
+            return {}
+        r = np.log(c).diff().dropna()
+
+        def _cum_return(lookback: int) -> float:
+            s = c.tail(int(lookback))
+            return float((s.iloc[-1] / s.iloc[0]) - 1.0) if len(s) >= 2 else float('nan')
+
+        def _vol(lookback: int) -> float:
+            s = r.tail(int(lookback))
+            return float(s.std()) if len(s) >= 2 else float('nan')
+
+        def _mdd(lookback: int) -> float:
+            s = c.tail(int(lookback))
+            if len(s) < 2:
+                return float('nan')
+            roll_max = s.cummax()
+            dd = (s / roll_max - 1.0).min()
+            return float(dd)
+
+        def _avg_vol(lookback: int) -> float:
+            if 'volume' not in df.columns:
+                return float('nan')
+            s = df['volume'].dropna().tail(int(lookback))
+            return float(s.mean()) if not s.empty else float('nan')
+
+        # Investor flows
+        df_inv = load_investor_flows_from_store(code, start, now)
+        def _inv_sum(col: str, lookback: int) -> float:
+            if df_inv is None or df_inv.empty or col not in df_inv.columns:
+                return float('nan')
+            s = df_inv[col].dropna()
+            cutoff = now - pd.Timedelta(days=int(lookback))
+            s = s[s.index >= cutoff]
+            return float(s.sum()) if not s.empty else float('nan')
+
+        feats = {
+            'ret20': _cum_return(20),
+            'ret60': _cum_return(60),
+            'vol20': _vol(20),
+            'vol60': _vol(60),
+            'mdd60': _mdd(60),
+            'avg_vol20': _avg_vol(20),
+            'inv_for20': _inv_sum('for_netprps', 20),
+            'inv_for60': _inv_sum('for_netprps', 60),
+            'inv_org60': _inv_sum('orgn_netprps', 60),
+            'inv_ind60': _inv_sum('ind_netprps', 60),
+        }
+        valid = {k: v for k, v in feats.items() if v == v and np.isfinite(v)}
+        return valid if len(valid) >= 3 else {}
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=3600)
+def build_data_similarity_index(window_days: int = 120, market: str = None) -> Dict[str, Any]:
+    now = pd.Timestamp.now()
+    df_list = get_stock_list()
+    if df_list is None or df_list.empty or 'code' not in df_list.columns:
+        return {'window_days': int(window_days), 'features': {}, 'stats': {}, 'updated_at': now.isoformat()}
+
+    universe = df_list.copy()
+    try:
+        meta_path = os.path.join(ROOT_DIR, 'cache', 'stock_market_caps.csv')
+        if market and market != '전체' and os.path.exists(meta_path):
+            meta_df = pd.read_csv(meta_path, dtype={'code': str, 'name': str})
+            if 'market' in meta_df.columns:
+                universe = universe.merge(meta_df[['code', 'market']], on='code', how='left')
+                universe = universe[universe['market'] == market]
+    except Exception:
+        pass
+
+    feats_map: Dict[str, Dict[str, float]] = {}
+    for row in universe.itertuples(index=False):
+        try:
+            code = getattr(row, 'code')
+        except Exception:
+            continue
+        f = _compute_features_from_store(str(code), int(window_days))
+        if f:
+            feats_map[str(code)] = f
+
+    if not feats_map:
+        return {'window_days': int(window_days), 'features': {}, 'stats': {}, 'updated_at': now.isoformat()}
+    df_feats = pd.DataFrame.from_dict(feats_map, orient='index')
+    stats = {}
+    for col in df_feats.columns:
+        s = df_feats[col]
+        mu = float(s.mean(skipna=True)) if len(s) else 0.0
+        sd = float(s.std(skipna=True)) if len(s) else 1.0
+        stats[col] = {'mean': mu, 'std': sd if sd and sd > 0 else 1.0}
+
+    return {'schema_version': '1.0.0', 'window_days': int(window_days), 'features': feats_map, 'stats': stats, 'updated_at': now.isoformat()}
+
+def _standardize_vector(feats: Dict[str, float], stats: Dict[str, Dict[str, float]], order: List[str]) -> np.ndarray:
+    vals = []
+    for k in order:
+        v = feats.get(k, float('nan'))
+        mu = stats.get(k, {}).get('mean', 0.0)
+        sd = stats.get(k, {}).get('std', 1.0)
+        if v != v or not np.isfinite(v):
+            z = 0.0
+        else:
+            z = (float(v) - mu) / (sd if sd else 1.0)
+        vals.append(z)
+    return np.array(vals, dtype=float)
+
+def find_similar_by_data(query_code: str, topn: int = 20, window_days: int = 120, market: str = None) -> List[Dict[str, Any]]:
+    idx = build_data_similarity_index(window_days=int(window_days), market=market)
+    feats_map = idx.get('features', {})
+    stats = idx.get('stats', {})
+    if not feats_map or str(query_code) not in feats_map:
+        return []
+    feature_order = sorted(stats.keys())
+    q = _standardize_vector(feats_map[str(query_code)], stats, feature_order)
+    out = []
+    for code, f in feats_map.items():
+        if str(code) == str(query_code):
+            continue
+        v = _standardize_vector(f, stats, feature_order)
+        dist = float(np.linalg.norm(q - v))
+        if np.isfinite(dist):
+            out.append({'code': code, 'distance': dist})
+    out.sort(key=lambda r: r['distance'])
+    return out[:int(topn)]
+
 # --- Main Application ---
 
 def main():
@@ -979,6 +1824,50 @@ def main():
     st.title("AI 기반 투자 분석 리포트")
     st.markdown(f"<div style='text-align: right; font-size: 0.9rem;'><b>조회 기준일:</b> {today_str} | <b>애널리스트:</b> {st.session_state.analyst_model}</div>", unsafe_allow_html=True)
     st.divider()
+
+    # --- Data Similarity (Stored Data) ---
+    st.header("8. 유사 종목 찾기 (Data Similarity)")
+    with st.container(border=True):
+        sim_cols = st.columns([1,1,1,1,1])
+        window_days = sim_cols[0].selectbox('기간(일)', options=[60, 120, 180], index=1)
+        topn = int(sim_cols[1].number_input('Top N', min_value=5, max_value=50, value=20, step=1))
+        # Market filter if meta available
+        market_opt = '전체'
+        try:
+            meta_path = os.path.join(ROOT_DIR, 'cache', 'stock_market_caps.csv')
+            if os.path.exists(meta_path):
+                meta_df = pd.read_csv(meta_path, dtype={'code': str, 'name': str})
+                if 'market' in meta_df.columns:
+                    markets = ['전체'] + sorted([m for m in meta_df['market'].dropna().unique().tolist()])
+                    market_opt = sim_cols[2].selectbox('시장', options=markets, index=0)
+        except Exception:
+            pass
+
+        if sim_cols[4].button('유사 종목 찾기', use_container_width=True):
+            if not stock_code:
+                st.error('종목을 먼저 선택하세요')
+            else:
+                with st.spinner('저장 데이터 기반 유사도 계산 중...'):
+                    res = find_similar_by_data(stock_code, topn=topn, window_days=window_days, market=market_opt if market_opt != '전체' else None)
+
+            # Map code->name
+            name_map = {}
+            try:
+                df_l = get_stock_list()
+                if isinstance(df_l, pd.DataFrame) and not df_l.empty:
+                    name_map = {str(r.code): str(r.name) for r in df_l.itertuples(index=False) if getattr(r, 'code', None) is not None}
+            except Exception:
+                name_map = {}
+
+            if not res:
+                st.warning('유사 결과가 없습니다. 저장 데이터 커버리지를 확인하세요.')
+            else:
+                st.subheader('유사 종목 목록 (데이터 기반)')
+                out_rows = []
+                for i, r in enumerate(res, start=1):
+                    c = str(r['code'])
+                    out_rows.append({'rank': i, 'name': name_map.get(c, '-'), 'code': c, 'distance': round(float(r['distance']), 4)})
+                st.dataframe(pd.DataFrame(out_rows), use_container_width=True, hide_index=True)
 
     # --- Main 4-Column Layout ---
     col1, col2, col3, col4 = st.columns([1, 1, 1, 1.5])
@@ -1295,6 +2184,831 @@ def main():
 
                 st.success('일괄 생성 완료')
                 st.text_area('로그', value='\n'.join(logs), height=200)
+
+    # --- Chart Image Clustering (reports/charts) ---
+    st.header("9. 차트 이미지 군집 (Reports/Charts)")
+    with st.container(border=True):
+        cols = st.columns([1,1,1,1])
+        k = int(cols[0].number_input('클러스터 수 (K)', min_value=2, max_value=12, value=4, step=1))
+        window_days_cluster = int(cols[1].selectbox('특징 기간(일)', options=[60, 120, 180], index=1))
+        max_images = int(cols[2].number_input('클러스터당 최대 이미지', min_value=2, max_value=30, value=8, step=1))
+        img_width = int(cols[3].number_input('이미지 폭(px)', min_value=150, max_value=500, value=240, step=10))
+
+        charts_dir = os.path.join(ROOT_DIR, 'reports', 'charts')
+
+        def _scan_chart_images(dir_path: str):
+            items = []
+            try:
+                if not os.path.exists(dir_path):
+                    return []
+                for fn in os.listdir(dir_path):
+                    if not fn.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        continue
+                    base, _ext = os.path.splitext(fn)
+                    # Expect patterns:
+                    #   <safe_name>_<YYYYmmdd>_<HHMMSS>
+                    #   or <safe_name>_<YYYYmmdd>
+                    m = re.match(r'^(.+)_([0-9]{8})(?:_([0-9]{6}))?$', base)
+                    if not m:
+                        # If unmatched, keep a best-effort split by first part as name
+                        if '_' in base:
+                            name_key = base.split('_')[0]
+                            ts_part = base[len(name_key)+1:]
+                            items.append({'name_key': name_key, 'ts': ts_part, 'path': os.path.join(dir_path, fn)})
+                        continue
+                    name_key = m.group(1)
+                    ts_date = m.group(2)
+                    ts_time = m.group(3) or ''
+                    ts_part = f"{ts_date}_{ts_time}" if ts_time else ts_date
+                    items.append({'name_key': name_key, 'ts': ts_part, 'path': os.path.join(dir_path, fn)})
+            except Exception:
+                return []
+            return items
+
+        def _namekey_to_code_map():
+            df = get_stock_list()
+            mapping = {}
+            # Primary: stock_list.csv
+            try:
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    for r in df.itertuples(index=False):
+                        nm = getattr(r, 'name', None)
+                        cd = getattr(r, 'code', None)
+                        if nm is None or cd is None:
+                            continue
+                        mapping[_safe_filename(str(nm))] = str(cd)
+            except Exception:
+                pass
+            # Augment: @data/instruments metadata (name->code)
+            try:
+                inst_dir = _instruments_dir()
+                if os.path.exists(inst_dir):
+                    for fn in os.listdir(inst_dir):
+                        if not fn.lower().endswith('.json'):
+                            continue
+                        obj = _load_json(os.path.join(inst_dir, fn)) or {}
+                        nm = obj.get('name')
+                        cd = obj.get('code')
+                        if nm and cd:
+                            mapping[_safe_filename(str(nm))] = str(cd)
+            except Exception:
+                pass
+            return mapping
+
+        def _build_feature_matrix(entries, name_to_code, win_days: int):
+            rows = []
+            codes = []
+            kept = []
+            feats_all = {}
+            feat_keys = None
+            for e in entries:
+                code = name_to_code.get(e['name_key'])
+                if not code:
+                    continue
+                f = _compute_features_from_store(code, window_days=win_days)
+                if not f:
+                    continue
+                feats_all[code] = f
+                if feat_keys is None:
+                    feat_keys = sorted(f.keys())
+                vec = [float(f.get(k, 0.0)) for k in feat_keys]
+                rows.append(vec)
+                codes.append(code)
+                kept.append(e)
+            if not rows:
+                return None, None, None, None
+            X = np.array(rows, dtype=float)
+            # Standardize features column-wise
+            mu = np.nanmean(X, axis=0)
+            sd = np.nanstd(X, axis=0)
+            sd[sd == 0] = 1.0
+            Z = (X - mu) / sd
+            return Z, codes, kept, feat_keys
+
+        def _kmeans(Z: np.ndarray, k: int, max_iter: int = 50, seed: int = 0):
+            rs = np.random.RandomState(int(seed))
+            n = Z.shape[0]
+            if n < k:
+                k = n
+            idx = rs.choice(n, size=k, replace=False)
+            C = Z[idx, :].copy()
+            labels = np.zeros(n, dtype=int)
+            for _ in range(max_iter):
+                # Assign
+                dists = ((Z[:, None, :] - C[None, :, :]) ** 2).sum(axis=2)
+                new_labels = np.argmin(dists, axis=1)
+                if np.array_equal(new_labels, labels):
+                    break
+                labels = new_labels
+                # Update
+                for j in range(k):
+                    mask = labels == j
+                    if not np.any(mask):
+                        # reinitialize empty centroid
+                        C[j] = Z[rs.choice(n)]
+                    else:
+                        C[j] = Z[mask].mean(axis=0)
+            return labels, C
+
+        # --- Trend + Foreign features ---
+        def _linreg_slope(y: np.ndarray) -> (float, float):
+            try:
+                n = len(y)
+                if n < 3:
+                    return float('nan'), 0.0
+                x = np.arange(n, dtype=float)
+                x = (x - x.mean()) / (x.std() if x.std() else 1.0)
+                y = (y - y.mean()) / (y.std() if y.std() else 1.0)
+                A = np.vstack([x, np.ones(n)]).T
+                # least squares
+                beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+                y_hat = A @ beta
+                ss_res = float(np.sum((y - y_hat) ** 2))
+                ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+                return float(beta[0]), float(max(0.0, min(1.0, r2)))
+            except Exception:
+                return float('nan'), 0.0
+
+        def _compute_trend_foreign_features(code: str, price_win: int, flow_win: int) -> Dict[str, float]:
+            now = pd.Timestamp.now()
+            start = now - pd.Timedelta(days=int(max(price_win, flow_win) * 3))
+            df = load_daily_candles_from_store(code, start, now)
+            if df is None or df.empty or 'close' not in df.columns:
+                return {}
+            df = df.sort_index()
+            c = df['close'].dropna()
+            if c.empty:
+                return {}
+            # Price features
+            c_tail = c.tail(int(price_win))
+            ret_price = float((c_tail.iloc[-1] / c_tail.iloc[0]) - 1.0) if len(c_tail) >= 2 else float('nan')
+            slope_price, r2_price = _linreg_slope(np.log(c_tail.values + 1e-9)) if len(c_tail) >= 3 else (float('nan'), 0.0)
+            ma20_gap = float(((c.tail(1).iloc[0]) - c.rolling(20).mean().tail(1).iloc[0]) / c.rolling(20).mean().tail(1).iloc[0]) if len(c) >= 25 else float('nan')
+
+            # Foreign flow features
+            df_inv = load_investor_flows_from_store(code, start, now)
+            inv_for = df_inv['for_netprps'].dropna() if isinstance(df_inv, pd.DataFrame) and 'for_netprps' in df_inv.columns else pd.Series(dtype=float)
+            inv_tail = inv_for.tail(int(flow_win)) if not inv_for.empty else pd.Series(dtype=float)
+            for_sum = float(inv_tail.sum()) if not inv_tail.empty else float('nan')
+            for_slope, _ = _linreg_slope(inv_tail.values) if len(inv_tail) >= 3 else (float('nan'), 0.0)
+            # recently turned positive: last 5-day sum > 0 and previous window sum <= 0
+            last5 = float(inv_for.tail(5).sum()) if not inv_for.empty else float('nan')
+            prev_window = float(inv_for.tail(int(flow_win)+5).head(max(0, int(flow_win))).sum()) if len(inv_for) >= (flow_win + 5) else float('nan')
+            for_recent_turn = 1.0 if (last5 == last5 and last5 > 0 and prev_window == prev_window and prev_window <= 0) else 0.0
+            # positive days count and recent positive streak length
+            pos_days = int((inv_tail > 0).sum()) if len(inv_tail) else 0
+            streak = 0
+            for v in reversed(inv_tail.values.tolist() if len(inv_tail) else []):
+                if v > 0:
+                    streak += 1
+                else:
+                    break
+            return {
+                'ret_price': ret_price,
+                'slope_price': slope_price,
+                'r2_price': r2_price,
+                'ma20_gap': ma20_gap,
+                'for_sum': for_sum,
+                'for_slope': for_slope,
+                'for_recent_turn': float(for_recent_turn),
+                'for_pos_days': float(pos_days),
+                'for_streak_up': float(streak),
+            }
+
+        # Mode controls
+        mode = st.selectbox('클러스터 기준', options=['최근추세+외국인', '기본(종합)'], index=0)
+        if mode == '최근추세+외국인':
+            c1, c2, c3 = st.columns([1,1,2])
+            price_win = int(c1.selectbox('가격창(일)', options=[20, 30, 60], index=1))
+            flow_win = int(c2.selectbox('외국인창(일)', options=[10, 20, 30], index=1))
+            w_price = float(c3.slider('가중치: 가격추세', min_value=0.0, max_value=1.0, value=0.7, step=0.05))
+            w_flow = 1.0 - w_price
+        else:
+            price_win = window_days_cluster
+            flow_win = 20
+            w_price = 0.5
+            w_flow = 0.5
+
+        if st.button('이미지 군집 실행', use_container_width=True):
+            with st.spinner('차트 이미지 스캔 및 군집화...'):
+                entries = _scan_chart_images(charts_dir)
+                # Keep most recent per name_key
+                latest = {}
+                for e in entries:
+                    prev = latest.get(e['name_key'])
+                    if prev is None or str(e['ts']) > str(prev['ts']):
+                        latest[e['name_key']] = e
+                entries = list(latest.values())
+                name_to_code = _namekey_to_code_map()
+                # Diagnostics: mapping coverage
+                total_imgs = len(entries)
+                mapped = [e for e in entries if e['name_key'] in name_to_code]
+                unmapped = [e for e in entries if e['name_key'] not in name_to_code]
+                if total_imgs == 0:
+                    st.warning('reports/charts 폴더에 이미지가 없습니다. 먼저 차트를 저장하세요.')
+                else:
+                    st.info(f"스캔된 최신 이미지: {total_imgs}개 | 코드 매핑됨: {len(mapped)}개 | 미매핑: {len(unmapped)}개")
+                    if unmapped:
+                        sample = ', '.join(sorted({e['name_key'] for e in unmapped})[:10])
+                        st.caption(f"미매핑 예시(최대 10개): {sample}")
+                # Feature matrix
+                if mode == '최근추세+외국인':
+                    # Build from trend+foreign features
+                    rows = []
+                    kept_entries = []
+                    feat_keys = ['ret_price','slope_price','r2_price','ma20_gap','for_sum','for_slope','for_recent_turn','for_pos_days','for_streak_up']
+                    for e in entries:
+                        code = name_to_code.get(e['name_key'])
+                        if not code:
+                            continue
+                        f = _compute_trend_foreign_features(code, price_win=price_win, flow_win=flow_win)
+                        if not f:
+                            continue
+                        vec = [float(f.get(k, 0.0)) for k in feat_keys]
+                        rows.append(vec)
+                        kept_entries.append(e)
+                    if not rows:
+                        Z = None
+                        codes = []
+                    else:
+                        X = np.array(rows, dtype=float)
+                        mu = np.nanmean(X, axis=0)
+                        sd = np.nanstd(X, axis=0)
+                        sd[sd == 0] = 1.0
+                        Z = (X - mu) / sd
+                        # Apply group weights
+                        price_idx = [0,1,2,3]
+                        flow_idx = [4,5,6,7,8]
+                        Z[:, price_idx] *= w_price
+                        Z[:, flow_idx] *= w_flow
+                        codes = [name_to_code.get(e['name_key']) for e in kept_entries]
+                else:
+                    Z, codes, kept_entries, feat_keys = _build_feature_matrix(entries, name_to_code, window_days_cluster)
+                if Z is None or Z.shape[0] == 0:
+                    st.warning('특징 벡터를 만들 수 있는 이미지가 없습니다. 저장된 데이터/코드를 확인하세요.')
+                    st.caption(f"매핑된 코드 수: {len(mapped)} | 특징 벡터 생성 성공: 0")
+                else:
+                    labels, C = _kmeans(Z, k=k, max_iter=50, seed=42)
+                    # Group by cluster
+                    clusters = {}
+                    for lab, e in zip(labels, kept_entries):
+                        clusters.setdefault(int(lab), []).append(e)
+                    st.write(f"군집 수: {len(clusters)} | 사용된 이미지: {sum(len(v) for v in clusters.values())}")
+                    # Render clusters
+                    for lab in sorted(clusters.keys()):
+                        st.subheader(f"Cluster {lab+1}")
+                        row = clusters[lab][:max_images]
+                        cols_row = st.columns(min(len(row), 5))
+                        for i, e in enumerate(row):
+                            with cols_row[i % len(cols_row)]:
+                                st.image(e['path'], caption=e['name_key'], width=img_width)
+
+    # --- Multiview Similarity & Clustering (Batch) ---
+    st.header("10. 유사도 기반 차트 군집 생성 (Multiview)")
+    with st.container(border=True):
+        # Controls
+        c1, c2, c3, c4 = st.columns([1,1,1,1])
+        nd = int(c1.selectbox('Daily window', options=[40, 60, 90], index=1))
+        nw = int(c2.selectbox('Weekly window', options=[26, 52, 78], index=1))
+        nm = int(c3.selectbox('Monthly window', options=[24, 36, 48], index=1))
+        inv20 = 20
+        inv60 = 60
+
+        w_cols = st.columns([1,1,1,1])
+        wD = float(w_cols[0].slider('Weight: Daily', min_value=0.0, max_value=1.0, value=0.35, step=0.05))
+        wW = float(w_cols[1].slider('Weight: Weekly', min_value=0.0, max_value=1.0, value=0.25, step=0.05))
+        wM = float(w_cols[2].slider('Weight: Monthly', min_value=0.0, max_value=1.0, value=0.25, step=0.05))
+        wI = float(w_cols[3].slider('Weight: Investor', min_value=0.0, max_value=1.0, value=0.15, step=0.05))
+
+        # Universe filter
+        u_cols = st.columns([1,1,1,1])
+        market_opt = '전체'
+        topN = int(u_cols[1].number_input('Top-N by MarketCap', min_value=20, max_value=500, value=150, step=10))
+        try:
+            meta_path = os.path.join(ROOT_DIR, 'cache', 'stock_market_caps.csv')
+            markets = ['전체']
+            if os.path.exists(meta_path):
+                meta_df = pd.read_csv(meta_path, dtype={'code': str, 'name': str})
+                if 'market' in meta_df.columns:
+                    markets = ['전체'] + sorted([m for m in meta_df['market'].dropna().unique().tolist()])
+            market_opt = u_cols[0].selectbox('시장(Market)', options=markets, index=0)
+        except Exception:
+            market_opt = '전체'
+            meta_df = None
+
+        method = u_cols[2].selectbox('Clustering', options=['agglomerative', 'dbscan'], index=0)
+        eps = float(u_cols[3].number_input('DBSCAN eps', min_value=0.1, max_value=1.0, value=0.35, step=0.05)) if method == 'dbscan' else 0.35
+
+        def _build_universe() -> list:
+            codes = []
+            try:
+                df_l = get_stock_list()
+                if isinstance(df_l, pd.DataFrame) and not df_l.empty:
+                    df_l = df_l.copy()
+                    df_l['code'] = df_l['code'].astype(str)
+                    if market_opt != '전체' and 'market' in df_l.columns:
+                        df_l = df_l[df_l['market'] == market_opt]
+                    # Join market cap if available
+                    try:
+                        if 'meta_df' in locals() and isinstance(meta_df, pd.DataFrame) and not meta_df.empty:
+                            meta_df_ = meta_df[['code', 'market_cap']].copy() if 'market_cap' in meta_df.columns else None
+                            if meta_df_ is not None:
+                                df_l = df_l.merge(meta_df_, on='code', how='left')
+                                df_l['market_cap'] = pd.to_numeric(df_l['market_cap'], errors='coerce')
+                                df_l = df_l.sort_values(by='market_cap', ascending=False)
+                        else:
+                            df_l = df_l.sort_values(by='code')
+                    except Exception:
+                        pass
+                    codes = df_l['code'].dropna().astype(str).head(topN).tolist()
+            except Exception:
+                codes = []
+            return codes
+
+        def _scan_chart_images(dir_path: str):
+            items = []
+            try:
+                if not os.path.exists(dir_path):
+                    return []
+                for fn in os.listdir(dir_path):
+                    if not fn.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        continue
+                    base, _ext = os.path.splitext(fn)
+                    m = re.match(r'^(.+)_([0-9]{8})(?:_([0-9]{6}))?$', base)
+                    if not m:
+                        if '_' in base:
+                            name_key = base.split('_')[0]
+                            ts_part = base[len(name_key)+1:]
+                            items.append({'name_key': name_key, 'ts': ts_part, 'path': os.path.join(dir_path, fn)})
+                        continue
+                    name_key = m.group(1)
+                    ts_date = m.group(2)
+                    ts_time = m.group(3) or ''
+                    ts_part = f"{ts_date}_{ts_time}" if ts_time else ts_date
+                    items.append({'name_key': name_key, 'ts': ts_part, 'path': os.path.join(dir_path, fn)})
+            except Exception:
+                return []
+            return items
+
+        def _namekey_to_code_map():
+            df = get_stock_list()
+            mapping = {}
+            try:
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    for r in df.itertuples(index=False):
+                        nm = getattr(r, 'name', None)
+                        cd = getattr(r, 'code', None)
+                        if nm is None or cd is None:
+                            continue
+                        mapping[_safe_filename(str(nm))] = str(cd)
+            except Exception:
+                pass
+            try:
+                inst_dir = _instruments_dir()
+                if os.path.exists(inst_dir):
+                    for fn in os.listdir(inst_dir):
+                        if not fn.lower().endswith('.json'):
+                            continue
+                        obj = _load_json(os.path.join(inst_dir, fn)) or {}
+                        nm = obj.get('name')
+                        cd = obj.get('code')
+                        if nm and cd:
+                            mapping[_safe_filename(str(nm))] = str(cd)
+            except Exception:
+                pass
+            return mapping
+
+        c5, c6, c7 = st.columns([1,1,1])
+        if c5.button('Build Index', use_container_width=True):
+            try:
+                from apps import similarity_multiview as smv
+            except Exception:
+                st.error('similarity_multiview 모듈을 찾을 수 없습니다.')
+                return
+            universe = _build_universe()
+            if len(universe) < 10:
+                st.warning('Universe is too small. Adjust filters to include >= 50 codes for better results.')
+            params = {
+                'windows': {'daily': nd, 'weekly': nw, 'monthly': nm, 'investor': (inv20, inv60)},
+                'load_daily': load_daily_candles_from_store,
+                'load_investor': load_investor_flows_from_store,
+                'derive_weekly_monthly': derive_weekly_monthly_from_daily,
+                'ensure_monthly_frequency': ensure_monthly_frequency,
+            }
+            st.info(f"Building multiview index for {len(universe)} codes...")
+            # Chunk progress
+            prog = st.progress(0.0, text='Indexing...')
+            # Build in batches to keep UI responsive
+            vectors = {}
+            stats_accum = None
+            batch = 50
+            for i in range(0, len(universe), batch):
+                sub = universe[i:i+batch]
+                idx_sub = smv.build_multiview_index(sub, params)
+                vectors.update(idx_sub.get('vectors', {}))
+                stats_accum = idx_sub.get('stats', stats_accum)
+                prog.progress(min(1.0, (i + len(sub)) / max(1, len(universe))), text=f'Indexing... {i+len(sub)}/{len(universe)}')
+                time.sleep(0.01)
+            index = {
+                'vectors': vectors,
+                'stats': stats_accum or {},
+                'meta': {'schema_version': '2.0.0', 'windows': {'daily': nd, 'weekly': nw, 'monthly': nm, 'investor': [inv20, inv60]}, 'updated_at': pd.Timestamp.now().isoformat()},
+            }
+            st.session_state['mv_index'] = index
+            st.session_state['mv_codes'] = sorted(list(vectors.keys()))
+            # Persist to @data/similarity
+            try:
+                out_path = smv.save_multiview_index(ROOT_DIR, index)
+                st.success(f"Index saved: {out_path}")
+            except Exception as e:
+                st.warning(f"Index saved in memory only. Save failed: {e}")
+
+        if c6.button('Build Clusters', use_container_width=True):
+            try:
+                from apps import similarity_multiview as smv
+            except Exception:
+                st.error('similarity_multiview 모듈 import 실패')
+                return
+            index = st.session_state.get('mv_index')
+            if not index:
+                st.error('Index not found. Build Index first.')
+            else:
+                weights = {'daily': wD, 'weekly': wW, 'monthly': wM, 'investor': wI}
+                params = {'alpha': 0.7, 'beta_bonus': 0.05, 'penalty_disagree': 0.03}
+                with st.spinner('Computing distance matrix...'):
+                    D, codes = smv.build_distance_matrix(index, weights, params)
+                with st.spinner('Clustering...'):
+                    if method == 'agglomerative':
+                        res = smv.cluster_from_distance_matrix(D, codes, method='agglomerative', params={'K_grid': [6,8,10,12,14]})
+                    else:
+                        res = smv.cluster_from_distance_matrix(D, codes, method='dbscan', params={'eps': eps, 'min_samples': 4})
+                st.session_state['mv_D'] = D
+                st.session_state['mv_clusters'] = res.get('clusters', {})
+                st.session_state['mv_labels'] = res.get('labels', {})
+                st.session_state['mv_medoids'] = res.get('medoids', {})
+                K = res.get('K')
+                sil = res.get('silhouette')
+                st.info(f"Clusters built. method={method}, K={K}, silhouette={sil}")
+
+        if c7.button('Materialize Folders', use_container_width=True):
+            clusters = st.session_state.get('mv_clusters') or {}
+            labels = st.session_state.get('mv_labels') or {}
+            if not clusters or not labels:
+                st.error('No clusters found. Build Clusters first.')
+            else:
+                # Build folder structure and copy the latest chart image per code into cluster folders
+                charts_dir = os.path.join(ROOT_DIR, 'reports', 'charts')
+                out_date = pd.Timestamp.now().strftime('%Y%m%d')
+                out_root = os.path.join(ROOT_DIR, 'reports', 'charts_clusters', out_date)
+                try:
+                    os.makedirs(out_root, exist_ok=True)
+                except Exception:
+                    pass
+                items = _scan_chart_images(charts_dir)
+                name_to_code = _namekey_to_code_map()
+                # Map code -> latest image path
+                code2img = {}
+                # build code occurrences
+                for e in items:
+                    code = name_to_code.get(e['name_key'])
+                    if not code:
+                        continue
+                    prev = code2img.get(code)
+                    if prev is None or (str(e['ts']) > str(prev.get('ts'))):
+                        code2img[code] = e
+                # Copy
+                copied = 0
+                for lab, codes_in in clusters.items():
+                    cdir = os.path.join(out_root, str(lab))
+                    try:
+                        os.makedirs(cdir, exist_ok=True)
+                    except Exception:
+                        pass
+                    for code in codes_in:
+                        e = code2img.get(code)
+                        if not e:
+                            continue
+                        fn = os.path.basename(e['path'])
+                        dst = os.path.join(cdir, fn)
+                        try:
+                            # copy file
+                            with open(e['path'], 'rb') as sf, open(dst, 'wb') as df:
+                                df.write(sf.read())
+                            copied += 1
+                        except Exception:
+                            continue
+                # Save manifest
+                try:
+                    from apps import similarity_multiview as smv
+                    manifest_dir = os.path.join(ROOT_DIR, '@data', 'clusters')
+                    os.makedirs(manifest_dir, exist_ok=True)
+                    manifest_path = os.path.join(manifest_dir, f'charts-{out_date}.json')
+                    params = {
+                        'windows': {'daily': nd, 'weekly': nw, 'monthly': nm, 'investor': [inv20, inv60]},
+                        'weights': {'daily': wD, 'weekly': wW, 'monthly': wM, 'investor': wI},
+                        'method': method,
+                        'universe_filter': {'market': market_opt, 'topN': topN}
+                    }
+                    meta = {'params': params, 'reports_root': f'reports/charts_clusters/{out_date}/', 'images': {k: (code2img[k]['path'] if k in code2img else None) for k in st.session_state.get('mv_codes', [])}}
+                    smv.save_clusters_manifest(manifest_path, clusters, labels, st.session_state.get('mv_medoids', {}), meta)
+                    st.success(f"Materialized {copied} images to {out_root}. Manifest: {manifest_path}")
+                except Exception as e:
+                    st.warning(f"Materialization done, but manifest save failed: {e}")
+
+    # --- Cluster Viewer ---
+    st.header("11. Cluster Viewer (Multiview)")
+    with st.container(border=True):
+        def _clusters_dir():
+            return os.path.join(ROOT_DIR, '@data', 'clusters')
+
+        def _list_cluster_manifests():
+            try:
+                d = _clusters_dir()
+                if not os.path.exists(d):
+                    return []
+                files = [fn for fn in os.listdir(d) if fn.startswith('charts-') and fn.endswith('.json')]
+                # sort by date descending if possible
+                def _key(fn):
+                    m = re.match(r'^charts-([0-9]{8})\.json$', fn)
+                    return m.group(1) if m else '00000000'
+                files = sorted(files, key=_key, reverse=True)
+                return files
+            except Exception:
+                return []
+
+        def _load_manifest(path: str):
+            cache = st.session_state.setdefault('cluster_viewer_cache', {})
+            key = ('manifest', path)
+            if key in cache:
+                return cache[key]
+            obj = _load_json(path) or {}
+            cache[key] = obj
+            return obj
+
+        def _load_mv_index_for_windows(windows: dict):
+            # Try session first
+            idx = st.session_state.get('mv_index')
+            meta_windows = idx.get('meta', {}).get('windows') if idx else None
+            if meta_windows and all(str(meta_windows.get(k)) == str(windows.get(k)) for k in ['daily', 'weekly', 'monthly']):
+                return idx
+            # Else load from disk per schema path
+            try:
+                nd = int(windows.get('daily', 60))
+                nw = int(windows.get('weekly', 52))
+                nm = int(windows.get('monthly', 36))
+            except Exception:
+                nd, nw, nm = 60, 52, 36
+            idx_path = os.path.join(ROOT_DIR, '@data', 'similarity', f'multiview-index-d{nd}-w{nw}-m{nm}.json')
+            cache = st.session_state.setdefault('cluster_viewer_cache', {})
+            key = ('index', os.path.basename(idx_path))
+            if key in cache:
+                return cache[key]
+            try:
+                with open(idx_path, 'r', encoding='utf-8') as f:
+                    obj = json.load(f)
+                cache[key] = obj
+                return obj
+            except Exception:
+                return None
+
+        def _code_to_name_map():
+            try:
+                df = get_stock_list()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    return {str(r.code): str(r.name) for r in df.itertuples(index=False)}
+            except Exception:
+                pass
+            return {}
+
+        def _resolve_image_path(date_str: str, cluster_id: str, code: str, images_map: dict, name_map: dict):
+            # 1) Prefer clustered folder image
+            cluster_dir = os.path.join(ROOT_DIR, 'reports', 'charts_clusters', date_str, str(cluster_id))
+            if os.path.exists(cluster_dir):
+                try:
+                    nm = name_map.get(str(code), '')
+                    key = _safe_filename(str(nm)) if nm else None
+                    candidates = []
+                    for fn in os.listdir(cluster_dir):
+                        if not fn.lower().endswith(('.jpg', '.jpeg', '.png')):
+                            continue
+                        if key and fn.startswith(key + '_'):
+                            candidates.append(os.path.join(cluster_dir, fn))
+                    # latest
+                    if candidates:
+                        candidates = sorted(candidates)
+                        return candidates[-1]
+                except Exception:
+                    pass
+            # 2) images map
+            p = images_map.get(str(code)) if isinstance(images_map, dict) else None
+            if p:
+                # normalize to absolute
+                if not os.path.isabs(p):
+                    p = os.path.join(ROOT_DIR, p)
+                if os.path.exists(p):
+                    return p
+            # 3) fallback scan reports/charts by company name
+            try:
+                nm = name_map.get(str(code), '')
+                key = _safe_filename(str(nm)) if nm else None
+                charts_dir = os.path.join(ROOT_DIR, 'reports', 'charts')
+                if key and os.path.exists(charts_dir):
+                    cand = [os.path.join(charts_dir, fn) for fn in os.listdir(charts_dir) if fn.startswith(key + '_') and fn.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                    if cand:
+                        return sorted(cand)[-1]
+            except Exception:
+                pass
+            return None
+
+        manifests = _list_cluster_manifests()
+        cols_top = st.columns([2, 1, 1])
+        if not manifests:
+            cols_top[0].info('No cluster manifests found. Build and materialize clusters first.')
+        else:
+            chosen = cols_top[0].selectbox('Select clusters manifest (@data/clusters)', options=manifests, index=0)
+            manifest_path = os.path.join(_clusters_dir(), chosen)
+            obj = _load_manifest(manifest_path)
+            params = obj.get('params', {})
+            windows = params.get('windows', {'daily': 60, 'weekly': 52, 'monthly': 36, 'investor': [20, 60]})
+            weights = params.get('weights', {'daily': 0.35, 'weekly': 0.25, 'monthly': 0.25, 'investor': 0.15})
+            reports_root = obj.get('reports_root', '')
+            date_str = re.search(r'charts-([0-9]{8})\.json$', chosen).group(1) if re.search(r'charts-([0-9]{8})\.json$', chosen) else ''
+            clusters = {int(k): [str(x) for x in v] for k, v in (obj.get('clusters') or {}).items()}
+            labels = {str(k): int(v) for k, v in (obj.get('labels') or {}).items()}
+            medoids = {int(k): str(v) for k, v in (obj.get('medoids') or {}).items()}
+            images_map = obj.get('images', {})
+
+            # Summary
+            sizes = {k: len(v) for k, v in clusters.items()}
+            cols_top[1].metric('Clusters', len(clusters))
+            cols_top[2].metric('Total items', sum(sizes.values()) if sizes else 0)
+            st.caption(f"Medoids: {', '.join([f'{k}->{v}' for k,v in medoids.items()])}")
+
+            # Controls
+            c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
+            cluster_ids = sorted(list(clusters.keys()))
+            if not cluster_ids:
+                st.warning('No clusters in manifest.')
+                st.stop()
+            cid = int(c1.selectbox('Cluster ID', options=cluster_ids, index=0))
+            sort_opt = c2.selectbox('Sort by', options=['code', 'distance-to-medoid'], index=1 if cid in medoids else 0)
+            topK = int(c3.slider('Top-K around medoid', min_value=10, max_value=60, value=30, step=5))
+            ncols = int(c4.slider('Grid columns', min_value=2, max_value=5, value=4))
+            img_w = int(c5.slider('Image width(px)', min_value=160, max_value=400, value=220, step=10))
+
+            name_map = _code_to_name_map()
+            codes = clusters.get(cid, [])
+            med_code = medoids.get(cid) if cid in medoids else (codes[0] if codes else None)
+            order = codes[:]
+            distances = None
+            if sort_opt == 'distance-to-medoid' and med_code and codes:
+                try:
+                    from apps import similarity_multiview as smv
+                except Exception:
+                    smv = None
+                if smv is None:
+                    st.warning('similarity_multiview not available; fallback to code sort.')
+                else:
+                    idx = _load_mv_index_for_windows(windows)
+                    if not idx:
+                        st.warning('Multiview index not found for selected windows; fallback to code sort.')
+                    else:
+                        with st.spinner('Computing distances to medoid...'):
+                            params_dist = {'alpha': 0.7, 'beta_bonus': 0.05, 'penalty_disagree': 0.03}
+                            dists = []
+                            for c in codes:
+                                try:
+                                    res = smv.compute_distance(med_code, c, idx, weights, params_dist)
+                                    d = float(res.get('total', float('nan')))
+                                    if not (d == d):
+                                        d = 1.0
+                                    dists.append((c, d))
+                                except Exception:
+                                    dists.append((c, 1.0))
+                            # ensure medoid first
+                            dists = sorted([x for x in dists if x[0] != med_code], key=lambda t: t[1])
+                            if topK and len(dists) > (topK - 1):
+                                dists = dists[:(topK - 1)]
+                            order = [med_code] + [c for c, _ in dists]
+                            distances = {c: d for c, d in dists}
+
+            # Missing images regeneration
+            regen = st.checkbox('Regenerate missing images if needed')
+            if regen and st.button('Generate Missing', use_container_width=True):
+                if 'kiwoom_handler' not in st.session_state:
+                    st.warning('Kiwoom handler is not initialized; cannot regenerate.')
+                else:
+                    with st.spinner('Generating images...'):
+                        prog = st.progress(0.0, text='Generating...')
+                        total = len(order)
+                        errors = 0
+                        for i, code in enumerate(order):
+                            p = _resolve_image_path(date_str, cid, code, images_map, name_map)
+                            if not p or not os.path.exists(p):
+                                nm = name_map.get(str(code), str(code))
+                                ok, msg = generate_and_save_combined_chart_headless(code, nm)
+                                if not ok:
+                                    errors += 1
+                            prog.progress((i + 1) / max(1, total), text=f'Generating... {i+1}/{total}')
+                        if errors:
+                            st.warning(f'Generation finished with {errors} errors.')
+                        else:
+                            st.success('Generation finished.')
+
+            # Render grid
+            st.subheader(f"Cluster {cid} ({len(codes)} items)")
+            cols = st.columns(ncols)
+            idx_col = 0
+            for i, code in enumerate(order):
+                p = _resolve_image_path(date_str, cid, code, images_map, name_map)
+                cap = f"{name_map.get(str(code), str(code))} ({code})"
+                if code == med_code:
+                    cap = f"★ Medoid | {cap}"
+                if distances and code in distances:
+                    cap = f"{cap} | d={distances[code]:.3f}"
+                with cols[idx_col % ncols]:
+                    if p and os.path.exists(p):
+                        st.image(p, caption=cap, width=img_w)
+                        st.caption(p)
+                    else:
+                        st.info(f"Image not found for {cap}")
+                idx_col += 1
+
+    # Stop here; legacy similarity removed below
+    return
+
+    # --- Similarity Finder ---
+    st.header("8. 유사 차트 찾기 (Similarity Search)")
+    with st.container(border=True):
+        sim_cols = st.columns([1,1,1,1,1])
+        window = sim_cols[0].selectbox('창 길이', options=[20, 60, 120], index=1)
+        feat_label = sim_cols[1].selectbox('특징', options=['모양(수익률)', '추세(가격)'], index=0)
+        feature = 'returns' if '수익률' in feat_label else 'price'
+        topn = int(sim_cols[2].number_input('Top N', min_value=5, max_value=50, value=20, step=1))
+
+        # Market filter if meta available
+        market_opt = '전체'
+        try:
+            meta_path = os.path.join(ROOT_DIR, 'cache', 'stock_market_caps.csv')
+            if os.path.exists(meta_path):
+                meta_df = pd.read_csv(meta_path, dtype={'code': str, 'name': str})
+                if 'market' in meta_df.columns:
+                    markets = ['전체'] + sorted([m for m in meta_df['market'].dropna().unique().tolist()])
+                    market_opt = sim_cols[3].selectbox('시장', options=markets, index=0)
+        except Exception:
+            pass
+
+        if sim_cols[4].button('유사 차트 찾기', use_container_width=True):
+            if not stock_code:
+                st.error('종목을 먼저 선택하세요.')
+            else:
+                with st.spinner('인덱스 구축/조회 및 유사도 계산 중...'):
+                    try:
+                        idx = build_similarity_index(window=window, feature=feature, market=market_opt if market_opt != '전체' else None)
+                    except Exception:
+                        idx = {}
+                    res = find_similar(stock_code, topn=topn, window=window, feature=feature, market=market_opt if market_opt != '전체' else None)
+
+                # Map code->name for titles
+                name_map = {}
+                try:
+                    df_l = get_stock_list()
+                    if isinstance(df_l, pd.DataFrame) and not df_l.empty:
+                        name_map = {str(r.code): str(r.name) for r in df_l.itertuples(index=False) if getattr(r, 'code', None) is not None}
+                except Exception:
+                    name_map = {}
+                name_map[str(stock_code)] = company_name
+
+                if not res:
+                    st.warning('유사 결과가 없습니다. 데이터 커버리지를 확인하세요.')
+                else:
+                    st.subheader('유사 종목 목록')
+                    out_rows = []
+                    for i, r in enumerate(res, start=1):
+                        c = str(r['code'])
+                        out_rows.append({
+                            'rank': i,
+                            'name': name_map.get(c, '-'),
+                            'code': c,
+                            'distance(낮을수록 유사)': round(float(r['distance']), 4),
+                            'overlap': int(r.get('overlap', 0))
+                        })
+                    st.dataframe(pd.DataFrame(out_rows), use_container_width=True, hide_index=True)
+
+                    st.subheader('오버레이 비교')
+                    # small multiples grid
+                    cols_per_row = 3
+                    for i in range(0, len(res), cols_per_row):
+                        row = res[i:i+cols_per_row]
+                        cols = st.columns(cols_per_row)
+                        for j, item in enumerate(row):
+                            with cols[j]:
+                                fig = _overlay_figure_for_pair(stock_code, item['code'], window, feature, name_map)
+                                if fig is not None:
+                                    st.plotly_chart(fig, use_container_width=True)
+                                else:
+                                    st.caption(f"{name_map.get(str(item['code']), str(item['code']))}: 데이터 부족")
 
 if __name__ == "__main__":
     main()
